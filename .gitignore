@@ -3,3 +3,5 @@ datasets/*
 *.bin
 *.json
 *.jsonl
+*.csv
+*.md
