@@ -59,7 +59,10 @@ def main() -> None:
     no_above_idx = len(labels)
     wmax = int(args.wmax) if args.wmax is not None else int(cfg["wmax"])
     max_seq_len = int(cfg.get("max_seq_len", 2 * wmax + 2))
-    use_2d_context = bool(args.use_2d_context or cfg.get("use_2d_context", False))
+    ckpt_use_2d = bool(cfg.get("use_2d_context", False))
+    if bool(args.use_2d_context) != ckpt_use_2d:
+        raise ValueError(f"use_2d_context mismatch: checkpoint={ckpt_use_2d} cli={bool(args.use_2d_context)}")
+    use_2d_context = ckpt_use_2d
 
     records = collect_images(args.data_root, subdir=args.subdir)
     split_facades = set(load_split_list(args.splits_dir / f"facade_{args.split}.txt"))
