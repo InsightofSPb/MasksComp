@@ -287,7 +287,8 @@ def masked_length_nll_bits(len_logits: torch.Tensor, targets: torch.Tensor, rema
     allowed = (idx >= 1) & (idx <= remaining.unsqueeze(-1))
     masked_logits = torch.where(allowed, len_logits, torch.full_like(len_logits, -1e9))
     log_probs = masked_logits - torch.logsumexp(masked_logits, dim=-1, keepdim=True)
-    gathered = torch.gather(log_probs, dim=-1, index=targets.clamp(min=0).unsqueeze(-1)).squeeze(-1)
+    gather_idx = targets.clamp(min=0, max=len_logits.shape[-1] - 1)
+    gathered = torch.gather(log_probs, dim=-1, index=gather_idx.unsqueeze(-1)).squeeze(-1)
     valid = targets >= 1
     nll_nats = torch.where(valid, -gathered, torch.zeros_like(gathered))
     return nll_nats / math.log(2.0)
@@ -325,7 +326,8 @@ def compute_shifted_token_bits(
     len_pos = tgt_valid & (tgt_types == 1)
 
     label_log_probs = F.log_softmax(pred_label, dim=-1)
-    label_bits = -torch.gather(label_log_probs, -1, tgt_ids.clamp(min=0).unsqueeze(-1)).squeeze(-1) / math.log(2.0)
+    label_idx = tgt_ids.clamp(min=0, max=pred_label.shape[-1] - 1)
+    label_bits = -torch.gather(label_log_probs, -1, label_idx.unsqueeze(-1)).squeeze(-1) / math.log(2.0)
     label_bits = torch.where(label_pos, label_bits, torch.zeros_like(label_bits))
 
     len_bits = masked_length_nll_bits(pred_len, tgt_ids, tgt_remw)
