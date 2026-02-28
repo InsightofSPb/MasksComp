@@ -10,7 +10,7 @@ import re
 import sys
 import zlib
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Iterable, List, Optional, Tuple
 
 import numpy as np
 
@@ -37,6 +37,19 @@ def parse_pair_years(name: str) -> Tuple[Optional[int], Optional[int]]:
     if not m:
         return None, None
     return int(m.group("y1")), int(m.group("y2"))
+
+
+def pixels_denom(H: int, W: int, C: int, mode: str) -> int:
+    """
+    Denominator for bbp:
+      - spatial: H*W (typical for segmentation masks)
+      - samples: H*W*C (typical for general images / multi-channel arrays)
+    """
+    if mode == "spatial":
+        return int(H * W)
+    if mode == "samples":
+        return int(H * W * C)
+    raise ValueError(f"Unknown bbp denom mode: {mode}")
 
 
 def as_uint_stream(arr: np.ndarray) -> Tuple[bytes, str]:
@@ -107,7 +120,6 @@ def rle_row_stream(mask: np.ndarray) -> bytes:
 
     for r in range(h):
         row = mask[r]
-        # Ensure Python int for comparisons
         cur = int(row[0])
         run = 1
         for c in range(1, w):
@@ -131,7 +143,6 @@ def compress_bytes(data: bytes, codec: str, level: int = 3) -> bytes:
     if codec == "bz2":
         return bz2.compress(data, compresslevel=max(1, min(9, level)))
     if codec == "lzma":
-        # preset 0..9 (9 is strongest)
         preset = max(0, min(9, level))
         return lzma.compress(data, preset=preset)
     if codec == "zstd":
@@ -162,7 +173,7 @@ def tiles_view(arr: np.ndarray, tile: int) -> Iterable[Tuple[int, int, np.ndarra
     h, w = arr.shape[:2]
     for y in range(0, h, tile):
         for x in range(0, w, tile):
-            patch = arr[y:min(h, y+tile), x:min(w, x+tile)]
+            patch = arr[y:min(h, y + tile), x:min(w, x + tile)]
             yield y, x, patch
 
 
@@ -173,8 +184,18 @@ def main():
     ap.add_argument("--include", default="warped_masks,diff_maps", help="Comma-separated subdirs to include")
     ap.add_argument("--codecs", default="zlib,bz2,lzma,zstd", help="Comma-separated codecs: zlib,bz2,lzma,zstd")
     ap.add_argument("--levels", default="1,3,6,9", help="Comma-separated levels (meaning depends on codec)")
-    ap.add_argument("--streams", default="raw,delta_left,rle_row", help="Comma-separated: raw,delta_left,rle_row")
+    ap.add_argument(
+        "--streams",
+        default="png_file,raw,delta_left,rle_row",
+        help="Comma-separated: png_file,raw,delta_left,rle_row",
+    )
     ap.add_argument("--tile", type=int, default=0, help="If >0, compute per-tile bbp and report mean/p50/p90")
+    ap.add_argument(
+        "--bbp-denom",
+        choices=["spatial", "samples"],
+        default="spatial",
+        help="bbp denominator: spatial=H*W (recommended for masks), samples=H*W*C",
+    )
     args = ap.parse_args()
 
     root = Path(args.root)
@@ -188,6 +209,12 @@ def main():
     # Validate zstd availability
     if "zstd" in codecs and _ZSTD_MODE == "none":
         print("WARN: zstd codec requested but python-zstandard is not installed; zstd will be skipped.", file=sys.stderr)
+
+    if args.tile and args.tile > 0 and "png_file" in streams:
+        print(
+            "NOTE: stream=png_file is a file-size baseline and is not computed in tile-mode; it will be skipped for tiles.",
+            file=sys.stderr,
+        )
 
     out_csv.parent.mkdir(parents=True, exist_ok=True)
 
@@ -213,7 +240,6 @@ def main():
                 y1, y2 = parse_pair_years(png_path.name)
 
                 arr = read_png(png_path)
-                # Ensure consistent shape info
                 if arr.ndim == 2:
                     H, W = arr.shape
                     C = 1
@@ -224,16 +250,21 @@ def main():
 
                 unique_vals = ""
                 if arr.ndim == 2 and arr.dtype in (np.uint8, np.uint16):
-                    # Safe unique count (downsample if huge? but usually fine)
                     u = np.unique(arr)
                     unique_vals = str(len(u))
 
-                # Tile mode
+                denom = pixels_denom(H, W, C, args.bbp_denom)
+
+                # -----------------------------
+                # TILE MODE
+                # -----------------------------
                 if args.tile and args.tile > 0:
                     tile = args.tile
-                    # For each (stream, codec, level) compute distribution across tiles
+
                     for stream in streams:
-                        # Only apply delta/rle to single-channel integer masks
+                        if stream == "png_file":
+                            continue  # file-size baseline doesn't decompose by tiles
+
                         def make_stream_bytes(patch: np.ndarray) -> bytes:
                             if stream == "raw":
                                 b, _ = as_uint_stream(patch)
@@ -244,9 +275,8 @@ def main():
                                 return rle_row_stream(patch)
                             raise ValueError(stream)
 
-                        # Precompute tile byte streams
                         tile_bytes: List[bytes] = []
-                        tile_pixels: List[int] = []
+                        tile_denoms: List[int] = []
                         for _, _, patch in tiles_view(arr, tile):
                             if stream != "raw" and (patch.ndim != 2 or patch.dtype not in (np.uint8, np.uint16)):
                                 continue
@@ -255,7 +285,10 @@ def main():
                             except Exception:
                                 continue
                             tile_bytes.append(b)
-                            tile_pixels.append(int(patch.shape[0] * patch.shape[1] * (1 if patch.ndim == 2 else patch.shape[2])))
+                            # per-tile bbp denom matches global mode
+                            ph, pw = patch.shape[:2]
+                            pc = 1 if patch.ndim == 2 else int(patch.shape[2])
+                            tile_denoms.append(pixels_denom(ph, pw, pc, args.bbp_denom))
 
                         if not tile_bytes:
                             continue
@@ -267,11 +300,11 @@ def main():
                                 bbps = []
                                 bytes_in_total = 0
                                 bytes_out_total = 0
-                                for b, pix in zip(tile_bytes, tile_pixels):
+                                for b, dnm in zip(tile_bytes, tile_denoms):
                                     bytes_in_total += len(b)
                                     cb = compress_bytes(b, codec=codec, level=level)
                                     bytes_out_total += len(cb)
-                                    bbps.append((len(cb) * 8.0) / max(1, pix))
+                                    bbps.append((len(cb) * 8.0) / max(1, dnm))
 
                                 bbps_np = np.array(bbps, dtype=np.float64)
                                 row = dict(
@@ -288,7 +321,7 @@ def main():
                                     level=level,
                                     bytes_in=bytes_in_total,
                                     bytes_out=bytes_out_total,
-                                    bbp=(bytes_out_total * 8.0) / max(1, H * W * C),
+                                    bbp=(bytes_out_total * 8.0) / max(1, denom),
                                     tile=tile,
                                     tiles_count=len(bbps),
                                     bbp_mean=float(bbps_np.mean()),
@@ -298,9 +331,40 @@ def main():
                                 w.writerow(row)
                                 rows_written += 1
 
+                # -----------------------------
+                # FULL-IMAGE MODE
+                # -----------------------------
                 else:
-                    # Full-image mode
                     for stream in streams:
+                        # (1) PNG file-size baseline (no extra codec pass)
+                        if stream == "png_file":
+                            bytes_file = int(os.path.getsize(png_path))
+                            row = dict(
+                                facade_id=facade_id,
+                                subdir=sd,
+                                filename=png_path.name,
+                                y1=y1 if y1 is not None else "",
+                                y2=y2 if y2 is not None else "",
+                                H=H, W=W, C=C,
+                                dtype=dtype_str,
+                                unique_vals=unique_vals,
+                                stream="png_file",
+                                codec="png",
+                                level="",
+                                bytes_in=bytes_file,
+                                bytes_out=bytes_file,
+                                bbp=(bytes_file * 8.0) / max(1, denom),
+                                tile="",
+                                tiles_count="",
+                                bbp_mean="",
+                                bbp_p50="",
+                                bbp_p90="",
+                            )
+                            w.writerow(row)
+                            rows_written += 1
+                            continue
+
+                        # (2) Other streams -> universal codecs
                         if stream == "raw":
                             data, _ = as_uint_stream(arr)
                         elif stream == "delta_left":
@@ -314,7 +378,6 @@ def main():
                         else:
                             raise ValueError(stream)
 
-                        pixels = int(H * W * C)
                         for codec in codecs:
                             if codec == "zstd" and _ZSTD_MODE == "none":
                                 continue
@@ -334,7 +397,7 @@ def main():
                                     level=level,
                                     bytes_in=len(data),
                                     bytes_out=len(comp),
-                                    bbp=(len(comp) * 8.0) / max(1, pixels),
+                                    bbp=(len(comp) * 8.0) / max(1, denom),
                                     tile="",
                                     tiles_count="",
                                     bbp_mean="",
