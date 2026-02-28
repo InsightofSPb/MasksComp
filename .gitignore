@@ -5,3 +5,5 @@ datasets/*
 *.jsonl
 *.csv
 *.md
+results*
+output*
