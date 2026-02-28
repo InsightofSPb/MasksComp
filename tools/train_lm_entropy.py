@@ -8,6 +8,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from tqdm.auto import tqdm
 
 from maskscomp.lm_entropy import (
     LMEntropyModel,
@@ -85,6 +86,10 @@ def main() -> None:
 
     max_seq_len = 2 * wmax + 2
     device = torch.device(args.device)
+    track_cuda_memory = device.type == "cuda" and torch.cuda.is_available()
+    if track_cuda_memory:
+        torch.cuda.reset_peak_memory_stats(device)
+
     model = LMEntropyModel(
         num_labels=len(labels),
         wmax=wmax,
@@ -111,13 +116,17 @@ def main() -> None:
     best_val = float("inf")
 
     for epoch in range(1, args.epochs + 1):
+        if track_cuda_memory:
+            torch.cuda.reset_peak_memory_stats(device)
+
         model.train()
         train_bits = 0.0
         train_pixels = 0
         train_loss_label = 0.0
         train_loss_len = 0.0
         n_batches = 0
-        for batch in train_loader:
+        train_pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs} [train]", leave=False)
+        for batch in train_pbar:
             optim.zero_grad(set_to_none=True)
             loss_label, loss_len, stats = compute_batch_losses(model, batch, device, args.use_2d_context)
             loss = loss_label + loss_len
@@ -131,6 +140,13 @@ def main() -> None:
             train_pixels += sum(int(m.W) for m in batch["meta"])
             n_batches += 1
 
+            avg_train_bbp = train_bits / max(1, train_pixels)
+            train_pbar.set_postfix(
+                train_bbp=f"{avg_train_bbp:.4f}",
+                loss_lbl=f"{train_loss_label / max(1, n_batches):.4f}",
+                loss_len=f"{train_loss_len / max(1, n_batches):.4f}",
+            )
+
         model.eval()
         val_bits = 0.0
         val_pixels = 0
@@ -138,13 +154,21 @@ def main() -> None:
         val_loss_len = 0.0
         val_batches = 0
         with torch.no_grad():
-            for batch in val_loader:
+            val_pbar = tqdm(val_loader, desc=f"Epoch {epoch}/{args.epochs} [val]", leave=False)
+            for batch in val_pbar:
                 loss_label, loss_len, stats = compute_batch_losses(model, batch, device, args.use_2d_context)
                 val_loss_label += float(loss_label.item())
                 val_loss_len += float(loss_len.item())
                 val_bits += stats["bits_label"] + stats["bits_len"]
                 val_pixels += sum(int(m.W) for m in batch["meta"])
                 val_batches += 1
+
+                avg_val_bbp = val_bits / max(1, val_pixels)
+                val_pbar.set_postfix(
+                    val_bbp=f"{avg_val_bbp:.4f}",
+                    loss_lbl=f"{val_loss_label / max(1, val_batches):.4f}",
+                    loss_len=f"{val_loss_len / max(1, val_batches):.4f}",
+                )
 
         train_bbp = train_bits / max(1, train_pixels)
         val_bbp = val_bits / max(1, val_pixels)
@@ -157,7 +181,24 @@ def main() -> None:
             "val_loss_len": val_loss_len / max(1, val_batches),
             "val_bbp": val_bbp,
         }
+        row["gpu_mem_allocated_mb"] = (
+            torch.cuda.memory_allocated(device) / (1024**2) if track_cuda_memory else None
+        )
+        row["gpu_mem_reserved_mb"] = (
+            torch.cuda.memory_reserved(device) / (1024**2) if track_cuda_memory else None
+        )
+        row["gpu_mem_peak_reserved_mb"] = (
+            torch.cuda.max_memory_reserved(device) / (1024**2) if track_cuda_memory else None
+        )
         log_rows.append(row)
+        print(
+            f"[Epoch {epoch}/{args.epochs}] "
+            f"train_bbp={train_bbp:.4f} val_bbp={val_bbp:.4f} "
+            f"train_loss=({row['train_loss_label']:.4f}, {row['train_loss_len']:.4f}) "
+            f"val_loss=({row['val_loss_label']:.4f}, {row['val_loss_len']:.4f}) "
+            f"gpu_reserved_mb={row['gpu_mem_reserved_mb']} "
+            f"gpu_peak_reserved_mb={row['gpu_mem_peak_reserved_mb']}"
+        )
         print(json.dumps(row))
 
         ckpt = {
@@ -172,7 +213,18 @@ def main() -> None:
 
     write_csv(
         args.out_dir / "train_log.csv",
-        fieldnames=["epoch", "train_loss_label", "train_loss_len", "train_bbp", "val_loss_label", "val_loss_len", "val_bbp"],
+        fieldnames=[
+            "epoch",
+            "train_loss_label",
+            "train_loss_len",
+            "train_bbp",
+            "val_loss_label",
+            "val_loss_len",
+            "val_bbp",
+            "gpu_mem_allocated_mb",
+            "gpu_mem_reserved_mb",
+            "gpu_mem_peak_reserved_mb",
+        ],
         rows=log_rows,
     )
 
