@@ -13,6 +13,35 @@ python tools/train_lm_entropy.py \
   --use-2d-context
 ```
 
+
+MSDZip-style backbone option (`--arch msdzip`) for fixed-context prediction:
+
+```bash
+python tools/train_lm_entropy.py \
+  --data-root /path/to/data \
+  --out-dir output/lm_msdzip \
+  --arch msdzip \
+  --timesteps 16 \
+  --vocab-dim 16 \
+  --hidden-dim 128 \
+  --ffn-dim 256 \
+  --layers 4
+```
+
+Run codec matrix with an MSDZip checkpoint (same CLI):
+
+```bash
+PYTHONPATH=$(pwd) python tools/run_lm_codec_matrix.py \
+  --data-root /path/to/data \
+  --subdir warped_masks \
+  --checkpoint output/lm_msdzip/checkpoints/best.pt \
+  --splits-dir output/lm_msdzip/splits \
+  --out-csv output/lm_msdzip/lm_matrix.csv
+```
+
+Note: codec scripts enable deterministic PyTorch ops. On CUDA this can require
+`CUBLAS_WORKSPACE_CONFIG=:4096:8` (or `:16:8`) in your environment.
+
 Evaluate ideal bits (cross-entropy) on split:
 
 ```bash

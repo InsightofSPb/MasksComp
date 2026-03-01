@@ -19,7 +19,7 @@ from maskscomp.entropy_coding.arith import (
     BitInputStream,
     BitOutputStream,
 )
-from maskscomp.lm_entropy import LMEntropyModel, read_mask_png
+from maskscomp.lm_entropy import build_model_from_checkpoint_config, read_mask_png
 from maskscomp.rle_tokenizer import decode_row_runs, encode_mask_to_row_tokens
 
 
@@ -123,19 +123,9 @@ def checkpoint_sha(path: Path) -> str:
 
 def _build_model(
     ckpt: dict, use_2d_context: bool, device: torch.device
-) -> LMEntropyModel:
+) -> torch.nn.Module:
     cfg = ckpt["config"]
-    wmax = int(cfg["wmax"])
-    model = LMEntropyModel(
-        num_labels=len(cfg["labels"]),
-        wmax=wmax,
-        d_model=int(cfg["d_model"]),
-        n_layers=int(cfg["n_layers"]),
-        n_heads=int(cfg["n_heads"]),
-        dropout=float(cfg["dropout"]),
-        max_seq_len=int(cfg.get("max_seq_len", 2 * wmax + 2)),
-        use_2d_context=use_2d_context,
-    )
+    model = build_model_from_checkpoint_config(cfg, use_2d_context=use_2d_context)
     model.load_state_dict(ckpt["model_state"])
     model.to(device)
     model.eval()
@@ -143,7 +133,7 @@ def _build_model(
 
 
 def _next_probs(
-    model: LMEntropyModel,
+    model: torch.nn.Module,
     prefix_tokens: List[int],
     prefix_types: List[int],
     above_label: List[int],
@@ -151,6 +141,13 @@ def _next_probs(
     use_2d_context: bool,
     device: torch.device,
 ) -> Tuple[np.ndarray, np.ndarray]:
+    if hasattr(model, "timesteps"):
+        t = int(model.timesteps)
+        prefix_tokens = prefix_tokens[-t:]
+        prefix_types = prefix_types[-t:]
+        above_label = above_label[-t:]
+        above_same = above_same[-t:]
+
     inp = torch.tensor(prefix_tokens, dtype=torch.long, device=device).unsqueeze(0)
     ttypes = torch.tensor(prefix_types, dtype=torch.long, device=device).unsqueeze(0)
     pad = torch.zeros_like(ttypes, dtype=torch.bool)
@@ -171,7 +168,7 @@ def _next_probs(
 
 
 def _online_update_row(
-    model: LMEntropyModel,
+    model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
     tokens: np.ndarray,
     token_types: np.ndarray,
@@ -244,25 +241,22 @@ def _online_update_row(
 
 def encode_mask(
     mask: np.ndarray,
-    model: LMEntropyModel,
+    model: torch.nn.Module,
     labels: Sequence[int],
     label_to_idx: Dict[int, int],
     use_2d_context: bool,
     online: OnlineConfig,
     device: torch.device,
 ) -> Tuple[bytes, float, float]:
-    """
-    Encode a single mask into an arithmetic-coded payload using the LM as entropy model.
-
-    IMPORTANT OPTIMIZATION:
-    - We do ONE forward pass per row (teacher forcing) and then sequentially arithmetic-encode
-      tokens using precomputed logits. This avoids O(T^2) "prefix-forward-per-token".
-    """
+    """Encode a mask using arithmetic coding with LM probabilities."""
     rows = encode_mask_to_row_tokens(mask)
     no_above_idx = len(labels)
+    is_msdzip = hasattr(model, "timesteps")
 
     optimizer = None
     if online.mode == "online":
+        if is_msdzip:
+            raise ValueError("Online adaptation is not supported for arch=msdzip")
         if online.optimizer != "sgd":
             raise ValueError("Only SGD online optimizer is supported")
         optimizer = torch.optim.SGD(model.parameters(), lr=online.lr, momentum=0.0)
@@ -275,19 +269,14 @@ def encode_mask(
     deferred_rows = []
 
     for row in rows:
-        # Map label tokens from raw label ids -> 0..C-1, keep length tokens as-is
         mapped = row.tokens.copy()
-        lab_mask = (row.token_types == 0)
+        lab_mask = row.token_types == 0
         if np.any(lab_mask):
-            # Fast mapping without np.vectorize overhead
             mapped_labels = mapped[lab_mask]
             mapped[lab_mask] = np.array([label_to_idx[int(x)] for x in mapped_labels], dtype=mapped.dtype)
 
-        # Build per-token 2D context arrays (default "no above")
         above_label = np.full((len(mapped),), fill_value=no_above_idx, dtype=np.int64)
         above_same = np.zeros((len(mapped),), dtype=np.int64)
-
-        # Fill context only at LABEL token positions of each run (position 2*j)
         if row.y > 0:
             for j in range(len(row.labels)):
                 x = int(row.run_starts[j])
@@ -297,78 +286,100 @@ def encode_mask(
                 above_label[2 * j] = ab_idx
                 above_same[2 * j] = 1 if ab_raw == cur_lab else 0
 
-        # Teacher forcing sequence for the whole row:
-        # seq = [BOS] + mapped_tokens
-        # logits at position t predict token at position t+1
-        input_tokens = np.concatenate(([no_above_idx], mapped.astype(np.int64, copy=False))).astype(np.int64)
-        input_types = np.concatenate(([-1], row.token_types.astype(np.int64, copy=False))).astype(np.int64)
-
-        # Align context with input positions: BOS has "no above"
-        al_full = np.concatenate(([no_above_idx], above_label)).astype(np.int64)
-        as_full = np.concatenate(([0], above_same)).astype(np.int64)
-
-        inp = torch.from_numpy(input_tokens).to(device).unsqueeze(0)  # [1, L]
-        tt = torch.from_numpy(input_types).to(device).unsqueeze(0)    # [1, L]
-        pad = torch.zeros_like(tt, dtype=torch.bool)
-
-        if use_2d_context:
-            al_t = torch.from_numpy(al_full).to(device).unsqueeze(0)
-            as_t = torch.from_numpy(as_full).to(device).unsqueeze(0)
-        else:
-            al_t = None
-            as_t = None
-
-        with torch.inference_mode():
-            label_logits, len_logits = model(
-                inp,
-                tt,
-                pad,
-                above_label=al_t,
-                above_same=as_t,
-            )
-
-        # Shift: predictions for mapped[t] come from logits at position t (starting from BOS at pos 0)
-        # So we take logits[:, :-1] and index by t (0..len(mapped)-1)
-        pred_label = label_logits[0, :-1].detach().cpu()  # [L-1, C]
-        pred_len = len_logits[0, :-1].detach().cpu()      # [L-1, Wmax+1]
-
         mapped_list = mapped.tolist()
         types_list = row.token_types.tolist()
 
-        for t, sym in enumerate(mapped_list):
-            next_type = int(types_list[t])  # 0=LABEL, 1=LEN
+        if not is_msdzip:
+            input_tokens = np.concatenate(([no_above_idx], mapped.astype(np.int64, copy=False))).astype(np.int64)
+            input_types = np.concatenate(([-1], row.token_types.astype(np.int64, copy=False))).astype(np.int64)
+            al_full = np.concatenate(([no_above_idx], above_label)).astype(np.int64)
+            as_full = np.concatenate(([0], above_same)).astype(np.int64)
 
-            if next_type == 0:
-                probs = torch.softmax(pred_label[t], dim=-1).numpy()
-                cdf = probs_to_cdf(probs)
-                p = max(float(probs[int(sym)]), 1e-12)
+            inp = torch.from_numpy(input_tokens).to(device).unsqueeze(0)
+            tt = torch.from_numpy(input_types).to(device).unsqueeze(0)
+            pad = torch.zeros_like(tt, dtype=torch.bool)
+
+            if use_2d_context:
+                al_t = torch.from_numpy(al_full).to(device).unsqueeze(0)
+                as_t = torch.from_numpy(as_full).to(device).unsqueeze(0)
             else:
-                # Length step: apply hard constraint len <= remaining_width
-                rem = int(row.rem_width[t])
-                probs = torch.softmax(pred_len[t], dim=-1).numpy()
+                al_t = None
+                as_t = None
 
-                allowed = np.zeros((model.wmax + 1,), dtype=bool)
-                if rem >= 1:
-                    allowed[1 : rem + 1] = True
+            with torch.inference_mode():
+                label_logits, len_logits = model(inp, tt, pad, above_label=al_t, above_same=as_t)
 
-                # ideal bits under masked+renormalized distribution
-                denom = float(probs[allowed].sum())
-                p = max(float(probs[int(sym)]) / max(denom, 1e-12), 1e-12)
+            pred_label = label_logits[0, :-1].detach().cpu()
+            pred_len = len_logits[0, :-1].detach().cpu()
 
-                cdf = probs_to_cdf(probs, allowed_mask=allowed)
+            for t, sym in enumerate(mapped_list):
+                next_type = int(types_list[t])
+                if next_type == 0:
+                    probs = torch.softmax(pred_label[t], dim=-1).numpy()
+                    cdf = probs_to_cdf(probs)
+                    p = max(float(probs[int(sym)]), 1e-12)
+                else:
+                    rem = int(row.rem_width[t])
+                    probs = torch.softmax(pred_len[t], dim=-1).numpy()
+                    allowed = np.zeros((model.wmax + 1,), dtype=bool)
+                    if rem >= 1:
+                        allowed[1 : rem + 1] = True
+                    denom = float(probs[allowed].sum())
+                    p = max(float(probs[int(sym)]) / max(denom, 1e-12), 1e-12)
+                    cdf = probs_to_cdf(probs, allowed_mask=allowed)
 
-            token_bits = -math.log2(p)
-            ideal_bits += token_bits
-            if next_type == 1:
-                ideal_len_bits += token_bits
+                token_bits = -math.log2(p)
+                ideal_bits += token_bits
+                if next_type == 1:
+                    ideal_len_bits += token_bits
+                enc.write(cdf, int(sym))
+        else:
+            prefix_tokens = [no_above_idx]
+            prefix_types = [-1]
+            prefix_al = [no_above_idx]
+            prefix_as = [0]
 
-            enc.write(cdf, int(sym))
+            for t, sym in enumerate(mapped_list):
+                next_type = int(types_list[t])
+                label_probs, len_probs = _next_probs(
+                    model,
+                    prefix_tokens,
+                    prefix_types,
+                    prefix_al,
+                    prefix_as,
+                    use_2d_context,
+                    device,
+                )
+                if next_type == 0:
+                    probs = label_probs
+                    cdf = probs_to_cdf(probs)
+                    p = max(float(probs[int(sym)]), 1e-12)
+                    prefix_al.append(int(above_label[t]))
+                    prefix_as.append(int(above_same[t]))
+                else:
+                    probs = len_probs
+                    rem = int(row.rem_width[t])
+                    allowed = np.zeros((model.wmax + 1,), dtype=bool)
+                    if rem >= 1:
+                        allowed[1 : rem + 1] = True
+                    denom = float(probs[allowed].sum())
+                    p = max(float(probs[int(sym)]) / max(denom, 1e-12), 1e-12)
+                    cdf = probs_to_cdf(probs, allowed_mask=allowed)
+                    prefix_al.append(no_above_idx)
+                    prefix_as.append(0)
 
-        # Online update after encoding (must be symmetric with decoder)
+                token_bits = -math.log2(p)
+                ideal_bits += token_bits
+                if next_type == 1:
+                    ideal_len_bits += token_bits
+                enc.write(cdf, int(sym))
+
+                prefix_tokens.append(int(sym))
+                prefix_types.append(next_type)
+
         if online.mode == "online":
             row_tup = (mapped, row.token_types, row.rem_width, above_label, above_same)
             deferred_rows.append(row_tup)
-
             if online.online_after == "row":
                 for _ in range(online.steps_per_row):
                     _online_update_row(
@@ -396,12 +407,10 @@ def encode_mask(
 
     enc.finish()
     return sink.getvalue(), ideal_bits, ideal_len_bits
-
-
 def decode_mask(
     payload: bytes,
     header: dict,
-    model: LMEntropyModel,
+    model: torch.nn.Module,
     use_2d_context: bool,
     device: torch.device,
 ) -> np.ndarray:
@@ -414,6 +423,8 @@ def decode_mask(
     online = OnlineConfig(**header["online"])
     optimizer = None
     if online.mode == "online":
+        if hasattr(model, "timesteps"):
+            raise ValueError("Online adaptation is not supported for arch=msdzip")
         optimizer = torch.optim.SGD(model.parameters(), lr=online.lr, momentum=0.0)
 
     out = np.zeros((h, w), dtype=np.dtype(header["dtype"]))
@@ -542,7 +553,7 @@ def decode_mask(
 
 def load_checkpoint_and_model(
     checkpoint_path: Path, use_2d_context: bool, device: torch.device
-) -> Tuple[dict, LMEntropyModel]:
+) -> Tuple[dict, torch.nn.Module]:
     ckpt = torch.load(checkpoint_path, map_location="cpu")
     cfg = ckpt["config"]
     ckpt_use_2d = bool(cfg.get("use_2d_context", False))

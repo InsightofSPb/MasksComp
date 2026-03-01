@@ -15,6 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
+from maskscomp.models import MSDZipMaskLM
 from maskscomp.rle_tokenizer import encode_mask_to_row_tokens
 
 IGNORE_INDEX = -100
@@ -246,6 +247,70 @@ class LMEntropyModel(nn.Module):
         return self.label_head(hidden), self.len_head(hidden)
 
 
+def build_lm_model(
+    arch: str,
+    num_labels: int,
+    wmax: int,
+    max_seq_len: int,
+    use_2d_context: bool,
+    d_model: int = 128,
+    n_layers: int = 4,
+    n_heads: int = 4,
+    dropout: float = 0.1,
+    timesteps: int = 16,
+    vocab_dim: int = 16,
+    hidden_dim: int = 128,
+    ffn_dim: int = 256,
+    layers: int = 4,
+) -> nn.Module:
+    arch = str(arch).lower()
+    if arch == "transformer":
+        return LMEntropyModel(
+            num_labels=num_labels,
+            wmax=wmax,
+            d_model=d_model,
+            n_layers=n_layers,
+            n_heads=n_heads,
+            dropout=dropout,
+            max_seq_len=max_seq_len,
+            use_2d_context=use_2d_context,
+        )
+    if arch == "msdzip":
+        return MSDZipMaskLM(
+            num_labels=num_labels,
+            wmax=wmax,
+            timesteps=timesteps,
+            vocab_dim=vocab_dim,
+            hidden_dim=hidden_dim,
+            ffn_dim=ffn_dim,
+            layers=layers,
+            dropout=dropout,
+            use_2d_context=use_2d_context,
+        )
+    raise ValueError(f"Unknown arch={arch!r}")
+
+
+def build_model_from_checkpoint_config(cfg: Dict[str, object], use_2d_context: bool) -> nn.Module:
+    arch = str(cfg.get("arch", "transformer")).lower()
+    wmax = int(cfg["wmax"])
+    return build_lm_model(
+        arch=arch,
+        num_labels=len(cfg["labels"]),
+        wmax=wmax,
+        max_seq_len=int(cfg.get("max_seq_len", 2 * wmax + 2)),
+        use_2d_context=use_2d_context,
+        d_model=int(cfg.get("d_model", 256)),
+        n_layers=int(cfg.get("n_layers", 4)),
+        n_heads=int(cfg.get("n_heads", 4)),
+        dropout=float(cfg.get("dropout", 0.1)),
+        timesteps=int(cfg.get("timesteps", 16)),
+        vocab_dim=int(cfg.get("vocab_dim", 16)),
+        hidden_dim=int(cfg.get("hidden_dim", 128)),
+        ffn_dim=int(cfg.get("ffn_dim", 256)),
+        layers=int(cfg.get("layers", cfg.get("n_layers", 4))),
+    )
+
+
 def collate_rows(batch: Sequence[Dict[str, object]]) -> Dict[str, object]:
     max_len = max(len(item["input_tokens"]) for item in batch)
     bsz = len(batch)
@@ -295,7 +360,7 @@ def masked_length_nll_bits(len_logits: torch.Tensor, targets: torch.Tensor, rema
 
 
 def compute_shifted_token_bits(
-    model: LMEntropyModel,
+    model: nn.Module,
     batch: Dict[str, torch.Tensor],
     device: torch.device,
     use_2d_context: bool,
@@ -342,7 +407,7 @@ def compute_shifted_token_bits(
 
 
 def compute_batch_losses(
-    model: LMEntropyModel,
+    model: nn.Module,
     batch: Dict[str, torch.Tensor],
     device: torch.device,
     use_2d_context: bool,

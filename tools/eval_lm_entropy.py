@@ -11,7 +11,7 @@ import numpy as np
 import torch
 
 from maskscomp.lm_entropy import (
-    LMEntropyModel,
+    build_model_from_checkpoint_config,
     RowTokenDataset,
     build_row_items,
     collect_images,
@@ -76,16 +76,7 @@ def main() -> None:
     ds = RowTokenDataset(rows, label_bos_idx=no_above_idx, no_above_idx=no_above_idx)
     loader = make_loader(ds, batch_size=args.batch_size, shuffle=False)
 
-    model = LMEntropyModel(
-        num_labels=len(labels),
-        wmax=wmax,
-        d_model=int(cfg["d_model"]),
-        n_layers=int(cfg["n_layers"]),
-        n_heads=int(cfg["n_heads"]),
-        dropout=float(cfg["dropout"]),
-        max_seq_len=max_seq_len,
-        use_2d_context=use_2d_context,
-    )
+    model = build_model_from_checkpoint_config(cfg, use_2d_context=use_2d_context)
     model.load_state_dict(ckpt["model_state"])
     device = torch.device(args.device)
     model.to(device)
