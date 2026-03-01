@@ -20,6 +20,7 @@ if __package__ is None or __package__ == "":
 
 from maskscomp.lm_entropy import (
     CachedRowTokenDataset,
+    FileShuffleRowSampler,
     RowTokenDataset,
     build_lm_model,
     build_row_items,
@@ -220,6 +221,7 @@ def main() -> None:
 
     no_above_idx = len(labels)
 
+    train_sampler = None
     if args.row_cache_dir is not None:
         manifest_path = args.row_cache_manifest or (args.row_cache_dir / "manifest.csv")
         manifest_rows = load_cache_manifest(manifest_path)
@@ -251,6 +253,7 @@ def main() -> None:
             use_2d_context=args.use_2d_context,
             lru_cache_size=args.row_cache_lru_size,
         )
+        train_sampler = FileShuffleRowSampler(train_ds, seed=args.seed)
     else:
         train_records = [r for r in records if r.facade_id in train_set]
         val_records = [r for r in records if r.facade_id in val_set]
@@ -278,7 +281,7 @@ def main() -> None:
         train_ds = RowTokenDataset(train_rows, label_bos_idx=no_above_idx, no_above_idx=no_above_idx)
         val_ds = RowTokenDataset(val_rows, label_bos_idx=no_above_idx, no_above_idx=no_above_idx)
 
-    train_loader = make_loader(train_ds, batch_size=args.batch_size, shuffle=True)
+    train_loader = make_loader(train_ds, batch_size=args.batch_size, shuffle=(train_sampler is None), sampler=train_sampler)
     val_loader = make_loader(val_ds, batch_size=args.batch_size, shuffle=False)
     log(f"Dataloaders: train_ds={len(train_ds)} val_ds={len(val_ds)} batch_size={args.batch_size}")
 
@@ -337,6 +340,8 @@ def main() -> None:
     best_val = float("inf")
 
     for epoch in range(1, args.epochs + 1):
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
         if track_cuda_memory:
             torch.cuda.reset_peak_memory_stats(device)
 

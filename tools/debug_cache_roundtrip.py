@@ -13,7 +13,7 @@ if __package__ is None or __package__ == "":
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
 
-from maskscomp.lm_entropy import load_cache_manifest, read_mask_png
+from maskscomp.lm_entropy import CachedRowTokenDataset, load_cache_manifest, read_mask_png
 
 
 def parse_args() -> argparse.Namespace:
@@ -58,6 +58,23 @@ def main() -> None:
 
     rng = random.Random(args.seed)
     chosen = rng.sample(entries, k=min(args.num_files, len(entries)))
+
+    ds = CachedRowTokenDataset(
+        cache_root=args.cache_root,
+        manifest_csv=args.manifest,
+        allowed_facade_ids=None,
+        label_bos_idx=0,
+        no_above_idx=0,
+        label_to_idx=None,
+        use_2d_context=False,
+        lru_cache_size=2,
+    )
+    print(f"[INFO] n_files={ds.n_files} total_rows={len(ds)}")
+    probe = sorted(set([0, max(0, len(ds) // 2), max(0, len(ds) - 1)]))
+    for idx in probe:
+        file_i, row_y = ds._locate(idx)
+        back_idx = int(ds.file_row_offsets[file_i] + row_y)
+        print(f"[MAP] global_idx={idx} -> file_i={file_i}, row_y={row_y}, back_idx={back_idx}")
 
     checked_rows = 0
     total_runs = 0

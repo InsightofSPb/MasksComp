@@ -7,14 +7,14 @@ import math
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 
 from maskscomp.models import MSDZipMaskLM
 from maskscomp.rle_tokenizer import encode_mask_to_row_tokens
@@ -233,19 +233,35 @@ class CachedRowTokenDataset(Dataset):
             self.label_to_idx = {int(k): int(v) for k, v in label_to_idx.items()}
 
         self.file_meta: List[Tuple[str, str, int, int, Path]] = []
-        self.row_index: List[Tuple[int, int]] = []
-        for i, e in enumerate(self.entries):
+        heights: List[int] = []
+        for e in self.entries:
             h = int(e["H"])
             w = int(e["W"])
             cache_rel = e["cache_path"]
             self.file_meta.append((e["facade_id"], e["rel_path"], h, w, self.cache_root / cache_rel))
-            for y in range(h):
-                self.row_index.append((i, y))
+            heights.append(h)
+
+        self.file_heights = np.asarray(heights, dtype=np.int64)
+        self.file_row_offsets = np.zeros((len(self.file_heights) + 1,), dtype=np.int64)
+        if self.file_heights.size > 0:
+            self.file_row_offsets[1:] = np.cumsum(self.file_heights, dtype=np.int64)
+        self.n_files = int(len(self.file_meta))
+        self.total_rows = int(self.file_row_offsets[-1])
 
         self._lru: OrderedDict[int, Dict[str, np.ndarray]] = OrderedDict()
 
     def __len__(self) -> int:
-        return len(self.row_index)
+        return self.total_rows
+
+    def _locate(self, idx: int) -> Tuple[int, int]:
+        idx = int(idx)
+        if idx < 0:
+            idx += self.total_rows
+        if idx < 0 or idx >= self.total_rows:
+            raise IndexError(f"index {idx} out of range for dataset of size {self.total_rows}")
+        file_i = int(np.searchsorted(self.file_row_offsets, idx, side="right") - 1)
+        row_y = int(idx - int(self.file_row_offsets[file_i]))
+        return file_i, row_y
 
     def _get_cached_file(self, file_i: int) -> Dict[str, np.ndarray]:
         if file_i in self._lru:
@@ -260,7 +276,7 @@ class CachedRowTokenDataset(Dataset):
         return arrs
 
     def __getitem__(self, idx: int) -> Dict[str, object]:
-        file_i, y = self.row_index[idx]
+        file_i, y = self._locate(int(idx))
         facade_id, rel_path, h, w, _path = self.file_meta[file_i]
         arrs = self._get_cached_file(file_i)
 
@@ -326,6 +342,31 @@ class CachedRowTokenDataset(Dataset):
             "above_same": above_same_i,
             "meta": row_meta,
         }
+
+
+class FileShuffleRowSampler(Sampler[int]):
+    def __init__(self, dataset: CachedRowTokenDataset, seed: int = 42) -> None:
+        self.dataset = dataset
+        self.seed = int(seed)
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def __iter__(self) -> Iterator[int]:
+        n_files = int(self.dataset.n_files)
+        file_indices = list(range(n_files))
+        rng = random.Random(self.seed + self.epoch)
+        rng.shuffle(file_indices)
+        offsets = self.dataset.file_row_offsets
+        for file_i in file_indices:
+            start = int(offsets[file_i])
+            end = int(offsets[file_i + 1])
+            for global_idx in range(start, end):
+                yield global_idx
+
+    def __len__(self) -> int:
+        return len(self.dataset)
 
 
 class LMEntropyModel(nn.Module):
@@ -697,8 +738,15 @@ def compute_batch_losses(
     return loss_label, loss_len, stats
 
 
-def make_loader(dataset: RowTokenDataset, batch_size: int, shuffle: bool) -> DataLoader:
-    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=0, collate_fn=collate_rows)
+def make_loader(
+    dataset: Dataset,
+    batch_size: int,
+    shuffle: bool,
+    sampler: Optional[Sampler[int]] = None,
+) -> DataLoader:
+    if sampler is not None and shuffle:
+        raise ValueError("shuffle must be False when sampler is provided")
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle if sampler is None else False, sampler=sampler, num_workers=0, collate_fn=collate_rows)
 
 
 def write_csv(path: Path, fieldnames: Sequence[str], rows: Iterable[Dict[str, object]]) -> None:
