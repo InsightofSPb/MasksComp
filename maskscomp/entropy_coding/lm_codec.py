@@ -57,45 +57,53 @@ def probs_to_cdf(
     )
     if allowed.shape != (v,):
         raise ValueError("allowed_mask has wrong shape")
-    if allowed.sum() == 0:
+
+    idxs = np.where(allowed)[0]
+    k = int(idxs.size)
+    if k == 0:
         raise ValueError("No allowed symbols")
-    if int(allowed.sum()) > int(total_freq):
+    if k > int(total_freq):
         raise ValueError("allowed symbols exceed total_freq")
 
     masked = np.where(allowed, np.maximum(probs, 0.0), 0.0)
-    total = float(masked.sum())
-    if total <= 0.0:
+    s = float(masked.sum())
+    if s <= 0.0:
         masked = allowed.astype(np.float64)
-        total = float(masked.sum())
+        s = float(masked.sum())
+    masked /= s
 
-    norm = masked / total
-    raw = norm * float(total_freq)
+    # Allocate at least 1 for each allowed symbol
     freq = np.zeros((v,), dtype=np.int64)
-    freq[allowed] = np.floor(raw[allowed]).astype(np.int64)
-    freq[allowed & (freq == 0)] = 1
+    freq[idxs] = 1
 
-    delta = int(total_freq - int(freq.sum()))
-    if delta > 0:
-        rema = raw - np.floor(raw)
-        idxs = np.where(allowed)[0]
-        order = idxs[np.argsort(-rema[idxs])]
-        for i in range(delta):
-            freq[order[i % len(order)]] += 1
-    elif delta < 0:
-        rema = raw - np.floor(raw)
-        idxs = np.where((allowed) & (freq > 1))[0]
-        if len(idxs) == 0:
-            raise ValueError("Cannot adjust frequencies")
-        order = idxs[np.argsort(rema[idxs])]
-        for i in range(-delta):
-            j = order[i % len(order)]
-            if freq[j] > 1:
-                freq[j] -= 1
+    remaining = int(total_freq) - k
+    if remaining < 0:
+        raise ValueError("total_freq too small for min-1 allocation")
+
+    if remaining > 0:
+        raw = masked[idxs] * float(remaining)
+        add = np.floor(raw).astype(np.int64)
+        freq[idxs] += add
+
+        leftover = remaining - int(add.sum())
+        if leftover > 0:
+            frac = raw - np.floor(raw)
+            order = idxs[np.argsort(-frac)]
+            # leftover < k typically, but cycle just in case
+            for i in range(leftover):
+                freq[order[i % k]] += 1
 
     if int(freq.sum()) != int(total_freq):
-        raise ValueError("Frequency sum mismatch")
+        # Hard safety fallback: fix on the largest allowed freq
+        j = idxs[int(np.argmax(freq[idxs]))]
+        freq[j] += int(total_freq) - int(freq.sum())
+
+    if int(freq.sum()) != int(total_freq):
+        raise ValueError("Frequency sum mismatch (after fallback)")
     if np.any(freq[~allowed] != 0):
         raise ValueError("Forbidden symbol received non-zero frequency")
+    if np.any(freq[idxs] <= 0):
+        raise ValueError("Non-positive freq for allowed symbol")
 
     cumul = np.zeros((v + 1,), dtype=np.uint32)
     cumul[1:] = np.cumsum(freq, dtype=np.uint64)
@@ -181,11 +189,11 @@ def _online_update_row(
     al = np.concatenate(([no_above_idx], above_label)).astype(np.int64)
     aeq = np.concatenate(([0], above_same)).astype(np.int64)
 
-    inp = torch.from_numpy(input_tokens).to(device).unsqueeze(0)
-    ttypes = torch.from_numpy(types).to(device).unsqueeze(0)
-    rem_t = torch.from_numpy(rem).to(device).unsqueeze(0)
-    al_t = torch.from_numpy(al).to(device).unsqueeze(0)
-    aeq_t = torch.from_numpy(aeq).to(device).unsqueeze(0)
+    inp = torch.from_numpy(input_tokens).to(device).unsqueeze(0)   # [1, L]
+    ttypes = torch.from_numpy(types).to(device).unsqueeze(0)       # [1, L]
+    rem_t = torch.from_numpy(rem).to(device).unsqueeze(0)          # [1, L]
+    al_t = torch.from_numpy(al).to(device).unsqueeze(0)            # [1, L]
+    aeq_t = torch.from_numpy(aeq).to(device).unsqueeze(0)          # [1, L]
     pad = torch.zeros_like(ttypes, dtype=torch.bool)
 
     with torch.enable_grad():
@@ -196,30 +204,37 @@ def _online_update_row(
             above_label=al_t if use_2d_context else None,
             above_same=aeq_t if use_2d_context else None,
         )
-        target = inp[:, 1:]
-        target_types = ttypes[:, 1:]
-        remw = rem_t[:, 1:]
 
-        pred_label = label_logits[:, :-1, :]
-        pred_len = len_logits[:, :-1, :]
+        # next-token targets
+        target = inp[:, 1:]          # [1, L-1] contains BOTH labels and lengths
+        target_types = ttypes[:, 1:] # [1, L-1] 0=label, 1=len
+        remw = rem_t[:, 1:]          # [1, L-1]
+
+        pred_label = label_logits[:, :-1, :]  # [1, L-1, C]
+        pred_len = len_logits[:, :-1, :]      # [1, L-1, Wmax+1]
 
         loss = torch.tensor(0.0, device=device)
+
+        # ---- label loss: gather ONLY at label positions
         label_pos = target_types == 0
         if label_pos.any():
-            logp = F.log_softmax(pred_label, dim=-1)
-            nll = -torch.gather(logp, -1, target.unsqueeze(-1)).squeeze(-1)
-            loss = loss + nll[label_pos].mean()
+            logp_lab = F.log_softmax(pred_label, dim=-1)  # [1, L-1, C]
+            lp = logp_lab[label_pos]                      # [N, C]
+            tg = target[label_pos]                        # [N]
+            nll = -lp.gather(-1, tg.unsqueeze(-1)).squeeze(-1)
+            loss = loss + nll.mean()
 
+        # ---- length loss: masked normalization, gather ONLY at len positions
         len_pos = target_types == 1
         if len_pos.any():
             idx = torch.arange(pred_len.shape[-1], device=device).view(1, 1, -1)
             allowed = (idx >= 1) & (idx <= remw.unsqueeze(-1))
-            masked_logits = torch.where(
-                allowed, pred_len, torch.full_like(pred_len, -1e9)
-            )
-            logp = masked_logits - torch.logsumexp(masked_logits, dim=-1, keepdim=True)
-            nll = -torch.gather(logp, -1, target.unsqueeze(-1)).squeeze(-1)
-            loss = loss + nll[len_pos].mean()
+            masked_logits = torch.where(allowed, pred_len, torch.full_like(pred_len, -1e9))
+            logp_len = masked_logits - torch.logsumexp(masked_logits, dim=-1, keepdim=True)  # [1, L-1, Vlen]
+            lp = logp_len[len_pos]   # [N, Vlen]
+            tg = target[len_pos]     # [N]
+            nll = -lp.gather(-1, tg.unsqueeze(-1)).squeeze(-1)
+            loss = loss + nll.mean()
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -236,8 +251,16 @@ def encode_mask(
     online: OnlineConfig,
     device: torch.device,
 ) -> Tuple[bytes, float, float]:
+    """
+    Encode a single mask into an arithmetic-coded payload using the LM as entropy model.
+
+    IMPORTANT OPTIMIZATION:
+    - We do ONE forward pass per row (teacher forcing) and then sequentially arithmetic-encode
+      tokens using precomputed logits. This avoids O(T^2) "prefix-forward-per-token".
+    """
     rows = encode_mask_to_row_tokens(mask)
     no_above_idx = len(labels)
+
     optimizer = None
     if online.mode == "online":
         if online.optimizer != "sgd":
@@ -246,52 +269,93 @@ def encode_mask(
 
     sink = io.BytesIO()
     enc = ArithmeticEncoder(BitOutputStream(sink))
+
     ideal_bits = 0.0
     ideal_len_bits = 0.0
     deferred_rows = []
 
     for row in rows:
+        # Map label tokens from raw label ids -> 0..C-1, keep length tokens as-is
         mapped = row.tokens.copy()
-        mapped[row.token_types == 0] = np.vectorize(label_to_idx.__getitem__)(
-            mapped[row.token_types == 0]
-        )
+        lab_mask = (row.token_types == 0)
+        if np.any(lab_mask):
+            # Fast mapping without np.vectorize overhead
+            mapped_labels = mapped[lab_mask]
+            mapped[lab_mask] = np.array([label_to_idx[int(x)] for x in mapped_labels], dtype=mapped.dtype)
+
+        # Build per-token 2D context arrays (default "no above")
         above_label = np.full((len(mapped),), fill_value=no_above_idx, dtype=np.int64)
         above_same = np.zeros((len(mapped),), dtype=np.int64)
-        for j in range(len(row.labels)):
-            if row.y == 0:
-                continue
-            x = int(row.run_starts[j])
-            cur_lab = int(row.labels[j])
-            ab = int(mask[row.y - 1, x])
-            above_label[2 * j] = label_to_idx[ab]
-            above_same[2 * j] = 1 if ab == cur_lab else 0
 
-        prefix_tokens = [no_above_idx]
-        prefix_types = [-1]
-        prefix_al = [no_above_idx]
-        prefix_as = [0]
-        for t, sym in enumerate(mapped.tolist()):
-            next_type = 0 if (t % 2 == 0) else 1
-            label_probs, len_probs = _next_probs(
-                model,
-                prefix_tokens,
-                prefix_types,
-                prefix_al,
-                prefix_as,
-                use_2d_context,
-                device,
+        # Fill context only at LABEL token positions of each run (position 2*j)
+        if row.y > 0:
+            for j in range(len(row.labels)):
+                x = int(row.run_starts[j])
+                cur_lab = int(row.labels[j])
+                ab_raw = int(mask[row.y - 1, x])
+                ab_idx = label_to_idx.get(ab_raw, no_above_idx)
+                above_label[2 * j] = ab_idx
+                above_same[2 * j] = 1 if ab_raw == cur_lab else 0
+
+        # Teacher forcing sequence for the whole row:
+        # seq = [BOS] + mapped_tokens
+        # logits at position t predict token at position t+1
+        input_tokens = np.concatenate(([no_above_idx], mapped.astype(np.int64, copy=False))).astype(np.int64)
+        input_types = np.concatenate(([-1], row.token_types.astype(np.int64, copy=False))).astype(np.int64)
+
+        # Align context with input positions: BOS has "no above"
+        al_full = np.concatenate(([no_above_idx], above_label)).astype(np.int64)
+        as_full = np.concatenate(([0], above_same)).astype(np.int64)
+
+        inp = torch.from_numpy(input_tokens).to(device).unsqueeze(0)  # [1, L]
+        tt = torch.from_numpy(input_types).to(device).unsqueeze(0)    # [1, L]
+        pad = torch.zeros_like(tt, dtype=torch.bool)
+
+        if use_2d_context:
+            al_t = torch.from_numpy(al_full).to(device).unsqueeze(0)
+            as_t = torch.from_numpy(as_full).to(device).unsqueeze(0)
+        else:
+            al_t = None
+            as_t = None
+
+        with torch.inference_mode():
+            label_logits, len_logits = model(
+                inp,
+                tt,
+                pad,
+                above_label=al_t,
+                above_same=as_t,
             )
+
+        # Shift: predictions for mapped[t] come from logits at position t (starting from BOS at pos 0)
+        # So we take logits[:, :-1] and index by t (0..len(mapped)-1)
+        pred_label = label_logits[0, :-1].detach().cpu()  # [L-1, C]
+        pred_len = len_logits[0, :-1].detach().cpu()      # [L-1, Wmax+1]
+
+        mapped_list = mapped.tolist()
+        types_list = row.token_types.tolist()
+
+        for t, sym in enumerate(mapped_list):
+            next_type = int(types_list[t])  # 0=LABEL, 1=LEN
+
             if next_type == 0:
-                cdf = probs_to_cdf(label_probs)
-                p = max(float(label_probs[sym]), 1e-12)
+                probs = torch.softmax(pred_label[t], dim=-1).numpy()
+                cdf = probs_to_cdf(probs)
+                p = max(float(probs[int(sym)]), 1e-12)
             else:
+                # Length step: apply hard constraint len <= remaining_width
                 rem = int(row.rem_width[t])
+                probs = torch.softmax(pred_len[t], dim=-1).numpy()
+
                 allowed = np.zeros((model.wmax + 1,), dtype=bool)
-                allowed[1 : rem + 1] = True
-                masked = len_probs * allowed
-                masked /= max(float(masked.sum()), 1e-12)
-                cdf = probs_to_cdf(len_probs, allowed_mask=allowed)
-                p = max(float(masked[sym]), 1e-12)
+                if rem >= 1:
+                    allowed[1 : rem + 1] = True
+
+                # ideal bits under masked+renormalized distribution
+                denom = float(probs[allowed].sum())
+                p = max(float(probs[int(sym)]) / max(denom, 1e-12), 1e-12)
+
+                cdf = probs_to_cdf(probs, allowed_mask=allowed)
 
             token_bits = -math.log2(p)
             ideal_bits += token_bits
@@ -299,14 +363,12 @@ def encode_mask(
                 ideal_len_bits += token_bits
 
             enc.write(cdf, int(sym))
-            prefix_tokens.append(int(sym))
-            prefix_types.append(next_type)
-            prefix_al.append(int(above_label[t]))
-            prefix_as.append(int(above_same[t]))
 
+        # Online update after encoding (must be symmetric with decoder)
         if online.mode == "online":
             row_tup = (mapped, row.token_types, row.rem_width, above_label, above_same)
             deferred_rows.append(row_tup)
+
             if online.online_after == "row":
                 for _ in range(online.steps_per_row):
                     _online_update_row(

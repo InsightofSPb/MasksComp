@@ -1,0 +1,87 @@
+seed: 42
+augmentations_per_image: 4
+overlay_alpha: 0.45
+palette: []  # optional list of RGB colors, leave empty for random palette
+
+tiling:
+  enabled: true
+  height: 448
+  width: 448
+  stride_h: 224
+  stride_w: 224
+  pad_mode: constant
+  min_content_ratio: 0.6
+
+paths:
+  images: /home/sasha/LPOSS/datasets/february_march_2026_data/images
+  masks: /home/sasha/LPOSS/datasets/february_march_2026_data/masks
+  # Optional: path to YAML/JSON dict mapping image filename -> mask filename when names differ
+  pairs: 
+  output_images: /home/sasha/LPOSS/datasets/february_march_2026_data/augmented/images
+  output_masks: /home/sasha/LPOSS/datasets/february_march_2026_data/augmented/masks
+  output_overlays: /home/sasha/LPOSS/datasets/february_march_2026_data/augmented/overlays
+
+save:
+  suffix: aug
+  image_format: png
+  mask_format: png
+  overlay_format: png
+
+augmentations:
+  size:
+    resize: {height: 448, width: 448}
+    random_crop: {height: 448, width: 448, p: 0.0}
+  zoom:
+    enabled: true
+    p: 0.35
+    scale_min: 0.7
+    scale_max: 1.0
+    ratio_min: 0.9
+    ratio_max: 1.1
+    damage_center_prob: 0.6
+
+  geometric:
+    horizontal_flip: 0.2
+    vertical_flip: 0.0
+    random_rotate90: 0.0
+    shift_scale_rotate: {shift_limit: 0.05, scale_limit: 0.1, rotate_limit: 10, p: 0.25}
+
+  photometric:
+    brightness_contrast: 0.40
+    brightness_limit: 0.22
+    contrast_limit: 0.22
+
+    hue_sat: 0.35
+    hue_shift_limit: 10
+    sat_shift_limit: 14
+    val_shift_limit: 10
+
+    rgb_shift: 0.20
+    r_shift: 10
+    g_shift: 10
+    b_shift: 10
+
+    gaussian_noise: 0.02
+    noise_var: [1.0, 2.0]
+
+  weather:
+    rain: 0.0
+    snow: 0.0
+    fog: 0.0
+    sun_flare: 0.0
+    shadow: 0.0
+
+  cutout:
+    num_holes: 8
+    max_h_size: 30
+    max_w_size: 30
+    fill_value: 0
+    p: 0.2
+
+  mixup:
+    alpha: 0.3
+    p: 0.3
+
+  cutmix:
+    alpha: 0.8
+    p: 0.2
