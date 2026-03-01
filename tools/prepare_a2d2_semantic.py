@@ -6,10 +6,16 @@ import csv
 import random
 import re
 from pathlib import Path
+import sys
 
 import numpy as np
 from PIL import Image
 
+if __package__ is None or __package__ == "":
+    repo_root = Path(__file__).resolve().parents[1]
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+        
 from maskscomp.datasets.a2d2 import parse_class_list, rgb_mask_to_id
 
 CAMERA_CHOICES = [
