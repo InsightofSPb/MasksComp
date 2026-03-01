@@ -19,6 +19,8 @@ if __package__ is None or __package__ == "":
         sys.path.insert(0, str(repo_root))
 
 from maskscomp.lm_entropy import (
+    CachedRowTokenDataset,
+    FileShuffleRowSampler,
     RowTokenDataset,
     build_lm_model,
     build_row_items,
@@ -29,6 +31,7 @@ from maskscomp.lm_entropy import (
     make_loader,
     save_split_lists,
     split_facades,
+    load_cache_manifest,
     write_csv,
 )
 from maskscomp.utils.msdzip_windows import compute_msdzip_window_loss_stats
@@ -143,6 +146,9 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--use-2d-context", action="store_true")
     p.add_argument("--device", type=str, default="cuda")
+    p.add_argument("--row-cache-dir", type=Path, default=None, help="Use precomputed row RLE cache directory")
+    p.add_argument("--row-cache-manifest", type=Path, default=None, help="Cache manifest CSV (default: <row-cache-dir>/manifest.csv)")
+    p.add_argument("--row-cache-lru-size", type=int, default=8)
     return p.parse_args()
 
 
@@ -213,34 +219,69 @@ def main() -> None:
     train_set = set(train_facades)
     val_set = set(val_facades)
 
-    train_records = [r for r in records if r.facade_id in train_set]
-    val_records = [r for r in records if r.facade_id in val_set]
-    log(f"Split records: train_records={len(train_records)} val_records={len(val_records)}")
-
-    if len(train_records) == 0:
-        raise RuntimeError("Empty train split after filtering records. Check --splits-dir and --subdir.")
-    if len(val_records) == 0:
-        log("WARNING: Empty val split after filtering records (val_bbp will be meaningless).")
-
     no_above_idx = len(labels)
-    log("Building row-wise token items (this can take a while on large masks)...")
 
-    t = time.perf_counter()
-    train_rows = build_row_items(train_records, label_to_idx=label_to_idx, no_above_idx=no_above_idx)
-    log(f"build_row_items(train): rows={len(train_rows)}, took {(time.perf_counter()-t):.2f}s")
+    train_sampler = None
+    if args.row_cache_dir is not None:
+        manifest_path = args.row_cache_manifest or (args.row_cache_dir / "manifest.csv")
+        manifest_rows = load_cache_manifest(manifest_path)
+        if not manifest_rows:
+            raise RuntimeError(f"Cache manifest is empty: {manifest_path}")
+        max_w_manifest = max(int(r["W"]) for r in manifest_rows)
+        if args.wmax is None:
+            wmax = max_w_manifest
+        if wmax < max_w_manifest:
+            raise ValueError(f"wmax={wmax} is smaller than cache max width={max_w_manifest}")
+        log(f"Using row cache from {args.row_cache_dir} manifest={manifest_path}")
+        train_ds = CachedRowTokenDataset(
+            cache_root=args.row_cache_dir,
+            manifest_csv=manifest_path,
+            allowed_facade_ids=train_set,
+            label_bos_idx=no_above_idx,
+            no_above_idx=no_above_idx,
+            label_to_idx=label_to_idx,
+            use_2d_context=args.use_2d_context,
+            lru_cache_size=args.row_cache_lru_size,
+        )
+        val_ds = CachedRowTokenDataset(
+            cache_root=args.row_cache_dir,
+            manifest_csv=manifest_path,
+            allowed_facade_ids=val_set,
+            label_bos_idx=no_above_idx,
+            no_above_idx=no_above_idx,
+            label_to_idx=label_to_idx,
+            use_2d_context=args.use_2d_context,
+            lru_cache_size=args.row_cache_lru_size,
+        )
+        train_sampler = FileShuffleRowSampler(train_ds, seed=args.seed)
+    else:
+        train_records = [r for r in records if r.facade_id in train_set]
+        val_records = [r for r in records if r.facade_id in val_set]
+        log(f"Split records: train_records={len(train_records)} val_records={len(val_records)}")
 
-    t = time.perf_counter()
-    val_rows = build_row_items(val_records, label_to_idx=label_to_idx, no_above_idx=no_above_idx)
-    log(f"build_row_items(val): rows={len(val_rows)}, took {(time.perf_counter()-t):.2f}s")
+        if len(train_records) == 0:
+            raise RuntimeError("Empty train split after filtering records. Check --splits-dir and --subdir.")
+        if len(val_records) == 0:
+            log("WARNING: Empty val split after filtering records (val_bbp will be meaningless).")
 
-    for row in train_rows + val_rows:
-        if np.any((row.token_types == 1) & (row.tokens > wmax)):
-            raise ValueError(f"Encountered run length > wmax ({wmax}) in {row.rel_path}")
+        log("Building row-wise token items (this can take a while on large masks)...")
 
-    train_ds = RowTokenDataset(train_rows, label_bos_idx=no_above_idx, no_above_idx=no_above_idx)
-    val_ds = RowTokenDataset(val_rows, label_bos_idx=no_above_idx, no_above_idx=no_above_idx)
+        t = time.perf_counter()
+        train_rows = build_row_items(train_records, label_to_idx=label_to_idx, no_above_idx=no_above_idx)
+        log(f"build_row_items(train): rows={len(train_rows)}, took {(time.perf_counter()-t):.2f}s")
 
-    train_loader = make_loader(train_ds, batch_size=args.batch_size, shuffle=True)
+        t = time.perf_counter()
+        val_rows = build_row_items(val_records, label_to_idx=label_to_idx, no_above_idx=no_above_idx)
+        log(f"build_row_items(val): rows={len(val_rows)}, took {(time.perf_counter()-t):.2f}s")
+
+        for row in train_rows + val_rows:
+            if np.any((row.token_types == 1) & (row.tokens > wmax)):
+                raise ValueError(f"Encountered run length > wmax ({wmax}) in {row.rel_path}")
+
+        train_ds = RowTokenDataset(train_rows, label_bos_idx=no_above_idx, no_above_idx=no_above_idx)
+        val_ds = RowTokenDataset(val_rows, label_bos_idx=no_above_idx, no_above_idx=no_above_idx)
+
+    train_loader = make_loader(train_ds, batch_size=args.batch_size, shuffle=(train_sampler is None), sampler=train_sampler)
     val_loader = make_loader(val_ds, batch_size=args.batch_size, shuffle=False)
     log(f"Dataloaders: train_ds={len(train_ds)} val_ds={len(val_ds)} batch_size={args.batch_size}")
 
@@ -287,6 +328,9 @@ def main() -> None:
     config["max_seq_len"] = max_seq_len
     config["arch"] = args.arch
     config["splits_used_dir"] = str(split_dir)
+    config["row_cache_dir"] = str(args.row_cache_dir) if args.row_cache_dir is not None else None
+    config["row_cache_manifest"] = str(args.row_cache_manifest) if args.row_cache_manifest is not None else None
+    config["row_cache_enabled"] = bool(args.row_cache_dir is not None)
     dump_json(args.out_dir / "config.json", config)
 
     log("Saved config.json to: " + str(args.out_dir / "config.json"))
@@ -296,6 +340,8 @@ def main() -> None:
     best_val = float("inf")
 
     for epoch in range(1, args.epochs + 1):
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
         if track_cuda_memory:
             torch.cuda.reset_peak_memory_stats(device)
 

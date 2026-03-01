@@ -11,6 +11,7 @@ import numpy as np
 import torch
 
 from maskscomp.lm_entropy import (
+    CachedRowTokenDataset,
     RowTokenDataset,
     build_model_from_checkpoint_config,
     build_row_items,
@@ -19,6 +20,7 @@ from maskscomp.lm_entropy import (
     compute_shifted_token_bits,
     load_split_list,
     make_loader,
+    load_cache_manifest,
 )
 
 
@@ -37,6 +39,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--use-2d-context", action="store_true")
     p.add_argument("--batch-size", type=int, default=256)
     p.add_argument("--device", type=str, default="cpu")
+    p.add_argument("--row-cache-dir", type=Path, default=None)
+    p.add_argument("--row-cache-manifest", type=Path, default=None)
+    p.add_argument("--row-cache-lru-size", type=int, default=8)
     return p.parse_args()
 
 
@@ -73,18 +78,35 @@ def main() -> None:
     if arch != ckpt_arch:
         raise ValueError(f"arch mismatch: checkpoint={ckpt_arch} cli={arch}")
 
-    records = collect_images(args.data_root, subdir=args.subdir)
     split_facades = set(load_split_list(args.splits_dir / f"facade_{args.split}.txt"))
-    rec_split = [r for r in records if r.facade_id in split_facades]
-    if args.max_items is not None:
-        rec_split = rec_split[: int(args.max_items)]
+    if args.row_cache_dir is not None:
+        manifest_path = args.row_cache_manifest or (args.row_cache_dir / "manifest.csv")
+        manifest_rows = load_cache_manifest(manifest_path)
+        max_w_manifest = max(int(r["W"]) for r in manifest_rows)
+        if wmax < max_w_manifest:
+            raise ValueError(f"wmax={wmax} is smaller than cache max width={max_w_manifest}")
+        ds = CachedRowTokenDataset(
+            cache_root=args.row_cache_dir,
+            manifest_csv=manifest_path,
+            allowed_facade_ids=split_facades,
+            label_bos_idx=no_above_idx,
+            no_above_idx=no_above_idx,
+            label_to_idx=label_to_idx,
+            use_2d_context=use_2d_context,
+            lru_cache_size=args.row_cache_lru_size,
+        )
+    else:
+        records = collect_images(args.data_root, subdir=args.subdir)
+        rec_split = [r for r in records if r.facade_id in split_facades]
+        if args.max_items is not None:
+            rec_split = rec_split[: int(args.max_items)]
 
-    rows = build_row_items(rec_split, label_to_idx=label_to_idx, no_above_idx=no_above_idx)
-    for row in rows:
-        if np.any((row.token_types == 1) & (row.tokens > wmax)):
-            raise ValueError(f"Encountered run length > wmax ({wmax}) in {row.rel_path}")
+        rows = build_row_items(rec_split, label_to_idx=label_to_idx, no_above_idx=no_above_idx)
+        for row in rows:
+            if np.any((row.token_types == 1) & (row.tokens > wmax)):
+                raise ValueError(f"Encountered run length > wmax ({wmax}) in {row.rel_path}")
 
-    ds = RowTokenDataset(rows, label_bos_idx=no_above_idx, no_above_idx=no_above_idx)
+        ds = RowTokenDataset(rows, label_bos_idx=no_above_idx, no_above_idx=no_above_idx)
     loader = make_loader(ds, batch_size=args.batch_size, shuffle=False)
 
     model = build_model_from_checkpoint_config(cfg, use_2d_context=use_2d_context)

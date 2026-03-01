@@ -1,19 +1,20 @@
 from __future__ import annotations
 
 import csv
+from collections import OrderedDict
 import json
 import math
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 
 from maskscomp.models import MSDZipMaskLM
 from maskscomp.rle_tokenizer import encode_mask_to_row_tokens
@@ -170,6 +171,202 @@ class RowTokenDataset(Dataset):
             "above_same": above_same,
             "meta": row,
         }
+
+
+def _load_cache_bundle(cache_path: Path) -> Dict[str, np.ndarray]:
+    cache_path = Path(cache_path)
+    if cache_path.suffix == ".npz":
+        with np.load(cache_path, allow_pickle=False) as z:
+            return {k: z[k] for k in z.files}
+    if cache_path.suffix == ".npy":
+        obj = np.load(cache_path, allow_pickle=True)
+        if not isinstance(obj, np.ndarray) or obj.dtype != object or obj.size != 1:
+            raise ValueError(f"Unsupported cache .npy structure: {cache_path}")
+        payload = obj.item()
+        if not isinstance(payload, dict):
+            raise ValueError(f"Unsupported cache .npy payload: {cache_path}")
+        return payload
+    raise ValueError(f"Unsupported cache extension for {cache_path}")
+
+
+def load_cache_manifest(manifest_csv: Path) -> List[Dict[str, str]]:
+    rows: List[Dict[str, str]] = []
+    with Path(manifest_csv).open("r", newline="", encoding="utf-8") as f:
+        rd = csv.DictReader(f)
+        for row in rd:
+            if not row:
+                continue
+            rows.append(dict(row))
+    return rows
+
+
+class CachedRowTokenDataset(Dataset):
+    def __init__(
+        self,
+        cache_root: Path,
+        manifest_csv: Path,
+        allowed_facade_ids: Optional[set[str]],
+        label_bos_idx: int,
+        no_above_idx: int,
+        label_to_idx: Optional[Dict[int, int]] = None,
+        use_2d_context: bool = False,
+        lru_cache_size: int = 8,
+    ) -> None:
+        self.cache_root = Path(cache_root)
+        self.entries = load_cache_manifest(manifest_csv)
+        if allowed_facade_ids is not None:
+            allowed = set(allowed_facade_ids)
+            self.entries = [e for e in self.entries if e["facade_id"] in allowed]
+        self.label_bos_idx = int(label_bos_idx)
+        self.no_above_idx = int(no_above_idx)
+        self.use_2d_context = bool(use_2d_context)
+        self.lru_cache_size = max(1, int(lru_cache_size))
+
+        max_label = 0
+        for e in self.entries:
+            uniq_s = e.get("unique_vals", "")
+            if uniq_s:
+                max_label = max(max_label, max(int(x) for x in uniq_s.split("|") if x != ""))
+        if label_to_idx is None:
+            self.label_to_idx = {i: i for i in range(max_label + 1)}
+        else:
+            self.label_to_idx = {int(k): int(v) for k, v in label_to_idx.items()}
+
+        self.file_meta: List[Tuple[str, str, int, int, Path]] = []
+        heights: List[int] = []
+        for e in self.entries:
+            h = int(e["H"])
+            w = int(e["W"])
+            cache_rel = e["cache_path"]
+            self.file_meta.append((e["facade_id"], e["rel_path"], h, w, self.cache_root / cache_rel))
+            heights.append(h)
+
+        self.file_heights = np.asarray(heights, dtype=np.int64)
+        self.file_row_offsets = np.zeros((len(self.file_heights) + 1,), dtype=np.int64)
+        if self.file_heights.size > 0:
+            self.file_row_offsets[1:] = np.cumsum(self.file_heights, dtype=np.int64)
+        self.n_files = int(len(self.file_meta))
+        self.total_rows = int(self.file_row_offsets[-1])
+
+        self._lru: OrderedDict[int, Dict[str, np.ndarray]] = OrderedDict()
+
+    def __len__(self) -> int:
+        return self.total_rows
+
+    def _locate(self, idx: int) -> Tuple[int, int]:
+        idx = int(idx)
+        if idx < 0:
+            idx += self.total_rows
+        if idx < 0 or idx >= self.total_rows:
+            raise IndexError(f"index {idx} out of range for dataset of size {self.total_rows}")
+        file_i = int(np.searchsorted(self.file_row_offsets, idx, side="right") - 1)
+        row_y = int(idx - int(self.file_row_offsets[file_i]))
+        return file_i, row_y
+
+    def _get_cached_file(self, file_i: int) -> Dict[str, np.ndarray]:
+        if file_i in self._lru:
+            v = self._lru.pop(file_i)
+            self._lru[file_i] = v
+            return v
+        _facade_id, _rel_path, _h, _w, p = self.file_meta[file_i]
+        arrs = _load_cache_bundle(p)
+        self._lru[file_i] = arrs
+        while len(self._lru) > self.lru_cache_size:
+            self._lru.popitem(last=False)
+        return arrs
+
+    def __getitem__(self, idx: int) -> Dict[str, object]:
+        file_i, y = self._locate(int(idx))
+        facade_id, rel_path, h, w, _path = self.file_meta[file_i]
+        arrs = self._get_cached_file(file_i)
+
+        row_ptr = arrs["row_ptr"]
+        starts = arrs["starts"]
+        lens = arrs["lens"]
+        labels = arrs["labels"]
+        a = int(row_ptr[y])
+        b = int(row_ptr[y + 1])
+        n_runs = b - a
+
+        tokens = np.empty((2 * n_runs,), dtype=np.int64)
+        token_types = np.empty((2 * n_runs,), dtype=np.int64)
+        rem_width = np.zeros((2 * n_runs,), dtype=np.int64)
+
+        lbl = labels[a:b].astype(np.int64, copy=False)
+        mapped_labels = np.array([self.label_to_idx[int(v)] for v in lbl], dtype=np.int64)
+        tokens[0::2] = mapped_labels
+        tokens[1::2] = lens[a:b].astype(np.int64, copy=False)
+        token_types[0::2] = 0
+        token_types[1::2] = 1
+        rem_width[1::2] = int(w) - starts[a:b].astype(np.int64, copy=False)
+
+        above_label = np.full((2 * n_runs,), fill_value=self.no_above_idx, dtype=np.int64)
+        above_same = np.zeros((2 * n_runs,), dtype=np.int64)
+        if self.use_2d_context:
+            if "above_label" not in arrs or "above_same" not in arrs:
+                raise ValueError(
+                    "Cache does not include above features. Rebuild cache with --include-above-features for --use-2d-context."
+                )
+            raw_above = arrs["above_label"][a:b].astype(np.int64, copy=False)
+            mapped_above = np.empty_like(raw_above)
+            for i, v in enumerate(raw_above.tolist()):
+                mapped_above[i] = self.no_above_idx if int(v) == 65535 else self.label_to_idx[int(v)]
+            above_label[0::2] = mapped_above
+            above_same[0::2] = arrs["above_same"][a:b].astype(np.int64, copy=False)
+
+        row_meta = RowItem(
+            facade_id=facade_id,
+            rel_path=rel_path,
+            y=int(y),
+            H=int(h),
+            W=int(w),
+            tokens=tokens,
+            token_types=token_types,
+            rem_width=rem_width,
+            above_label=above_label,
+            above_same=above_same,
+        )
+
+        input_tokens = np.concatenate(([self.label_bos_idx], tokens)).astype(np.int64)
+        target_tokens = np.concatenate(([IGNORE_INDEX], tokens)).astype(np.int64)
+        token_types_i = np.concatenate(([-1], token_types)).astype(np.int64)
+        rem_width_i = np.concatenate(([0], rem_width)).astype(np.int64)
+        above_label_i = np.concatenate(([self.no_above_idx], above_label)).astype(np.int64)
+        above_same_i = np.concatenate(([0], above_same)).astype(np.int64)
+        return {
+            "input_tokens": input_tokens,
+            "target_tokens": target_tokens,
+            "token_types": token_types_i,
+            "rem_width": rem_width_i,
+            "above_label": above_label_i,
+            "above_same": above_same_i,
+            "meta": row_meta,
+        }
+
+
+class FileShuffleRowSampler(Sampler[int]):
+    def __init__(self, dataset: CachedRowTokenDataset, seed: int = 42) -> None:
+        self.dataset = dataset
+        self.seed = int(seed)
+        self.epoch = 0
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    def __iter__(self) -> Iterator[int]:
+        n_files = int(self.dataset.n_files)
+        file_indices = list(range(n_files))
+        rng = random.Random(self.seed + self.epoch)
+        rng.shuffle(file_indices)
+        offsets = self.dataset.file_row_offsets
+        for file_i in file_indices:
+            start = int(offsets[file_i])
+            end = int(offsets[file_i + 1])
+            for global_idx in range(start, end):
+                yield global_idx
+
+    def __len__(self) -> int:
+        return len(self.dataset)
 
 
 class LMEntropyModel(nn.Module):
@@ -541,8 +738,15 @@ def compute_batch_losses(
     return loss_label, loss_len, stats
 
 
-def make_loader(dataset: RowTokenDataset, batch_size: int, shuffle: bool) -> DataLoader:
-    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=0, collate_fn=collate_rows)
+def make_loader(
+    dataset: Dataset,
+    batch_size: int,
+    shuffle: bool,
+    sampler: Optional[Sampler[int]] = None,
+) -> DataLoader:
+    if sampler is not None and shuffle:
+        raise ValueError("shuffle must be False when sampler is provided")
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle if sampler is None else False, sampler=sampler, num_workers=0, collate_fn=collate_rows)
 
 
 def write_csv(path: Path, fieldnames: Sequence[str], rows: Iterable[Dict[str, object]]) -> None:

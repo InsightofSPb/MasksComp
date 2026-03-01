@@ -53,6 +53,45 @@ python tools/eval_lm_entropy.py \
   --out-csv output/lm_val_metrics.csv
 ```
 
+## Row cache for large datasets
+
+For large mask corpora (e.g. A2D2), precompute a row-wise RLE cache to avoid keeping all
+`RowItem` objects in RAM:
+
+```bash
+python tools/cache_row_tokens.py \
+  --data-root /path/to/data \
+  --subdir warped_masks \
+  --cache-dir /path/to/data/cache_rle_row_v1 \
+  --manifest-out /path/to/data/cache_rle_row_v1/manifest.csv \
+  --include-above-features \
+  --compress npz \
+  --verify 2
+```
+
+Train using the cache (same model/loss code path, lazy row loading):
+
+```bash
+python tools/train_lm_entropy.py \
+  --data-root /path/to/data \
+  --subdir warped_masks \
+  --out-dir output/lm_rle_cached \
+  --row-cache-dir /path/to/data/cache_rle_row_v1 \
+  --epochs 5
+```
+
+Evaluate with cache-backed rows:
+
+```bash
+python tools/eval_lm_entropy.py \
+  --data-root /path/to/data \
+  --checkpoint output/lm_rle_cached/checkpoints/best.pt \
+  --split val \
+  --splits-dir output/lm_rle_cached/splits \
+  --row-cache-dir /path/to/data/cache_rle_row_v1 \
+  --out-csv output/lm_val_metrics_cached.csv
+```
+
 ## A2D2 quickstart
 
 1) Convert A2D2 RGB semantic labels to class-id masks in MasksComp layout:
