@@ -4,7 +4,6 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import math
 from collections import defaultdict
 from pathlib import Path
 
@@ -16,11 +15,11 @@ from maskscomp.lm_entropy import (
     build_model_from_checkpoint_config,
     build_row_items,
     collect_images,
+    compute_msdzip_shifted_token_bits,
     compute_shifted_token_bits,
     load_split_list,
     make_loader,
 )
-from maskscomp.utils.msdzip_windows import compute_msdzip_window_loss_stats
 
 
 def parse_args() -> argparse.Namespace:
@@ -74,8 +73,6 @@ def main() -> None:
     if arch != ckpt_arch:
         raise ValueError(f"arch mismatch: checkpoint={ckpt_arch} cli={arch}")
 
-    timesteps = int(args.timesteps) if args.timesteps is not None else int(cfg.get("timesteps", 16))
-
     records = collect_images(args.data_root, subdir=args.subdir)
     split_facades = set(load_split_list(args.splits_dir / f"facade_{args.split}.txt"))
     rec_split = [r for r in records if r.facade_id in split_facades]
@@ -95,38 +92,19 @@ def main() -> None:
     device = torch.device(args.device)
     model.to(device)
     model.eval()
+    is_msdzip = bool(ckpt_arch == "msdzip") or hasattr(model, "timesteps")
+    timesteps = int(args.timesteps) if args.timesteps is not None else int(getattr(model, "timesteps", cfg.get("timesteps", 16)))
 
     per_image = defaultdict(lambda: {"bits_label": 0.0, "bits_len": 0.0, "H": 0, "W": 0, "facade_id": "", "rel_path": ""})
-    total_label_bits = 0.0
-    total_len_bits = 0.0
-    total_label_tokens = 0
-    total_len_tokens = 0
-
     with torch.no_grad():
         for batch in loader:
-            if arch == "msdzip":
-                # MSDZip scoring: fixed-context next-token CE only.
-                _, _, stats = compute_msdzip_window_loss_stats(
-                    model=model,
-                    batch=batch,
-                    device=device,
-                    use_2d_context=use_2d_context,
-                    timesteps=timesteps,
-                )
-                row_bits_label = stats["row_bits_label"].numpy()
-                row_bits_len = stats["row_bits_len"].numpy()
-                total_label_bits += float(stats["bits_label"])
-                total_len_bits += float(stats["bits_len"])
-                total_label_tokens += int(stats["n_label"])
-                total_len_tokens += int(stats["n_len"])
+            if is_msdzip:
+                out = compute_msdzip_shifted_token_bits(model, batch, device, use_2d_context, timesteps=timesteps)
             else:
                 out = compute_shifted_token_bits(model, batch, device, use_2d_context)
-                row_bits_label = out["label_bits"].sum(dim=1).cpu().numpy()
-                row_bits_len = out["len_bits"].sum(dim=1).cpu().numpy()
-                total_label_bits += float(out["label_bits"].sum().item())
-                total_len_bits += float(out["len_bits"].sum().item())
-                total_label_tokens += int(out["label_pos"].sum().item())
-                total_len_tokens += int(out["len_pos"].sum().item())
+
+            row_bits_label = out["label_bits"].sum(dim=1).cpu().numpy()
+            row_bits_len = out["len_bits"].sum(dim=1).cpu().numpy()
 
             for i, meta in enumerate(batch["meta"]):
                 key = (meta.facade_id, meta.rel_path)
@@ -193,14 +171,7 @@ def main() -> None:
         "arch": arch,
         "bbp_total": describe(np.asarray(bbps_total, dtype=np.float64)),
         "bbp_len": describe(np.asarray(bbps_len, dtype=np.float64)),
-        "mean_bits_per_token_label": float(total_label_bits / max(1, total_label_tokens)),
-        "mean_bits_per_token_len": float(total_len_bits / max(1, total_len_tokens)) if total_len_tokens > 0 else 0.0,
-        "mean_bits_per_token_total": float((total_label_bits + total_len_bits) / max(1, total_label_tokens + total_len_tokens)),
-        "n_label_tokens": int(total_label_tokens),
-        "n_len_tokens": int(total_len_tokens),
     }
-    if arch == "msdzip":
-        summary["msdzip_eval_note"] = "Scoring is fixed-context next-token CE with left-padded windows."
     print(json.dumps(summary, indent=2))
 
 
