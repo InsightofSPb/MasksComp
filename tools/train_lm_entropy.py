@@ -26,6 +26,7 @@ from maskscomp.lm_entropy import (
     split_facades,
     write_csv,
 )
+from maskscomp.utils.msdzip_windows import compute_msdzip_window_loss_stats
 
 
 def parse_args() -> argparse.Namespace:
@@ -55,112 +56,6 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def compute_msdzip_window_losses(model: torch.nn.Module, batch: dict, device: torch.device, use_2d_context: bool, timesteps: int):
-    input_tokens = batch["input_tokens"]
-    token_types = batch["token_types"]
-    rem_width = batch["rem_width"]
-    pad_mask = batch["pad_mask"]
-    above_label = batch["above_label"]
-    above_same = batch["above_same"]
-
-    bsz, seqlen = input_tokens.shape
-    bos_vals = input_tokens[:, :1]
-    no_above_vals = above_label[:, :1]
-
-    win_inp = []
-    win_types = []
-    win_al = []
-    win_as = []
-    tgt_ids = []
-    tgt_types = []
-    tgt_rem = []
-
-    for b in range(bsz):
-        valid = (~pad_mask[b]).nonzero(as_tuple=False).flatten()
-        if valid.numel() <= 1:
-            continue
-        n = int(valid[-1].item()) + 1
-        for t in range(1, n):
-            start = max(0, t - timesteps)
-            ctx_tokens = input_tokens[b, start:t]
-            ctx_types = token_types[b, start:t]
-            ctx_al = above_label[b, start:t]
-            ctx_as = above_same[b, start:t]
-            ctx_len = int(ctx_tokens.numel())
-
-            x_tok = bos_vals[b].repeat(timesteps)
-            x_typ = torch.full((timesteps,), fill_value=-1, dtype=torch.long)
-            x_al = no_above_vals[b].repeat(timesteps)
-            x_as = torch.zeros((timesteps,), dtype=torch.long)
-            if ctx_len > 0:
-                x_tok[-ctx_len:] = ctx_tokens
-                x_typ[-ctx_len:] = ctx_types
-                x_al[-ctx_len:] = ctx_al
-                x_as[-ctx_len:] = ctx_as
-
-            win_inp.append(x_tok)
-            win_types.append(x_typ)
-            win_al.append(x_al)
-            win_as.append(x_as)
-            tgt_ids.append(input_tokens[b, t])
-            tgt_types.append(token_types[b, t])
-            tgt_rem.append(rem_width[b, t])
-
-    if not win_inp:
-        z = torch.tensor(0.0, device=device)
-        return z, z, {"bits_label": 0.0, "bits_len": 0.0, "n_label": 0, "n_len": 0}
-
-    inp = torch.stack(win_inp, dim=0).to(device)
-    ttypes = torch.stack(win_types, dim=0).to(device)
-    al = torch.stack(win_al, dim=0).to(device)
-    aeq = torch.stack(win_as, dim=0).to(device)
-    target_ids = torch.stack(tgt_ids, dim=0).to(device)
-    target_types = torch.stack(tgt_types, dim=0).to(device)
-    target_rem = torch.stack(tgt_rem, dim=0).to(device)
-    pad = torch.zeros_like(inp, dtype=torch.bool)
-
-    label_logits, len_logits = model(
-        inp,
-        ttypes,
-        pad,
-        above_label=al if use_2d_context else None,
-        above_same=aeq if use_2d_context else None,
-    )
-    pred_label = label_logits[:, -1, :]
-    pred_len = len_logits[:, -1, :]
-
-    label_pos = target_types == 0
-    len_pos = target_types == 1
-
-    label_bits = torch.zeros((target_ids.shape[0],), device=device)
-    if label_pos.any():
-        lp = torch.log_softmax(pred_label[label_pos], dim=-1)
-        tg = target_ids[label_pos].clamp(min=0, max=pred_label.shape[-1] - 1)
-        label_bits[label_pos] = -lp.gather(-1, tg.unsqueeze(-1)).squeeze(-1) / np.log(2.0)
-
-    len_bits = torch.zeros((target_ids.shape[0],), device=device)
-    if len_pos.any():
-        lp_len = pred_len[len_pos]
-        rem = target_rem[len_pos]
-        idx = torch.arange(lp_len.shape[-1], device=device).view(1, -1)
-        allowed = (idx >= 1) & (idx <= rem.unsqueeze(-1))
-        masked_logits = torch.where(allowed, lp_len, torch.full_like(lp_len, -1e9))
-        logp = masked_logits - torch.logsumexp(masked_logits, dim=-1, keepdim=True)
-        tg = target_ids[len_pos].clamp(min=1, max=lp_len.shape[-1] - 1)
-        len_bits[len_pos] = -logp.gather(-1, tg.unsqueeze(-1)).squeeze(-1) / np.log(2.0)
-
-    loss_label = torch.tensor(0.0, device=device)
-    if label_pos.any():
-        loss_label = (label_bits[label_pos] * np.log(2.0)).mean()
-    loss_len = torch.tensor(0.0, device=device)
-    if len_pos.any():
-        loss_len = (len_bits[len_pos] * np.log(2.0)).mean()
-    return loss_label, loss_len, {
-        "bits_label": float(label_bits.sum().item()),
-        "bits_len": float(len_bits.sum().item()),
-        "n_label": int(label_pos.sum().item()),
-        "n_len": int(len_pos.sum().item()),
-    }
 
 
 def main() -> None:
@@ -253,7 +148,7 @@ def main() -> None:
         for batch in train_pbar:
             optim.zero_grad(set_to_none=True)
             if args.arch == "msdzip":
-                loss_label, loss_len, stats = compute_msdzip_window_losses(
+                loss_label, loss_len, stats = compute_msdzip_window_loss_stats(
                     model, batch, device, args.use_2d_context, args.timesteps
                 )
             else:
@@ -286,7 +181,7 @@ def main() -> None:
             val_pbar = tqdm(val_loader, desc=f"Epoch {epoch}/{args.epochs} [val]", leave=False)
             for batch in val_pbar:
                 if args.arch == "msdzip":
-                    loss_label, loss_len, stats = compute_msdzip_window_losses(
+                    loss_label, loss_len, stats = compute_msdzip_window_loss_stats(
                         model, batch, device, args.use_2d_context, args.timesteps
                     )
                 else:
