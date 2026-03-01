@@ -38,7 +38,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--val-ratio", type=float, default=0.2)
     p.add_argument("--wmax", type=int, default=None)
     p.add_argument("--epochs", type=int, default=5)
-    p.add_argument("--batch-size", type=int, default=512)
+    p.add_argument("--batch-size", type=int, default=1024)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=1e-2)
     p.add_argument("--arch", choices=["transformer", "msdzip"], default="transformer")
