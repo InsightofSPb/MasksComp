@@ -74,6 +74,73 @@ class Split:
     val_facades: List[str]
 
 
+def _read_id_list(path: Path) -> List[str]:
+    if not path.exists():
+        raise FileNotFoundError(f"Split list not found: {path}")
+    out: List[str] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        out.append(s)
+    # de-dup while preserving order
+    seen = set()
+    uniq: List[str] = []
+    for x in out:
+        if x in seen:
+            continue
+        seen.add(x)
+        uniq.append(x)
+    return uniq
+
+
+def _pick_existing(dir_path: Path, preferred_name: Optional[str], candidates: List[str]) -> Path:
+    if preferred_name:
+        p = dir_path / preferred_name
+        if p.exists():
+            return p
+        raise FileNotFoundError(f"Requested split file does not exist: {p}")
+    for name in candidates:
+        p = dir_path / name
+        if p.exists():
+            return p
+    raise FileNotFoundError(
+        "Could not find split files in splits-dir. Looked for: "
+        + ", ".join(str(dir_path / c) for c in candidates)
+    )
+
+
+def load_splits(
+    splits_dir: Path,
+    train_split_file: Optional[str] = None,
+    val_split_file: Optional[str] = None,
+) -> Split:
+    splits_dir = Path(splits_dir)
+    train_path = _pick_existing(splits_dir, train_split_file, ["facade_train.txt", "train.txt", "split_train.txt"])
+    val_path = _pick_existing(splits_dir, val_split_file, ["facade_val.txt", "val.txt", "split_val.txt"])
+
+    train_ids = _read_id_list(train_path)
+    val_ids = _read_id_list(val_path)
+
+    # If there is overlap, keep val as-is and remove duplicates from train.
+    overlap = set(train_ids).intersection(val_ids)
+    if overlap:
+        train_ids = [x for x in train_ids if x not in overlap]
+
+    return Split(train_facades=train_ids, val_facades=val_ids)
+
+
+def save_used_splits(out_dir: Path, split: Split) -> None:
+    sd = Path(out_dir) / "splits"
+    sd.mkdir(parents=True, exist_ok=True)
+    (sd / "facade_train.txt").write_text(
+        "\n".join(split.train_facades) + ("\n" if split.train_facades else ""), encoding="utf-8"
+    )
+    (sd / "facade_val.txt").write_text(
+        "\n".join(split.val_facades) + ("\n" if split.val_facades else ""), encoding="utf-8"
+    )
+
+
 def split_facades(facade_ids: List[str], val_ratio: float, seed: int) -> Split:
     rng = random.Random(seed)
     ids = sorted(set(facade_ids))
@@ -641,6 +708,27 @@ def main() -> None:
     ap.add_argument("--data-root", required=True)
     ap.add_argument("--subdir", default="warped_masks")
     ap.add_argument("--out-dir", required=True)
+
+    # Splits: either precomputed lists (recommended) or random split by --val-ratio/--seed
+    ap.add_argument(
+        "--splits-dir",
+        type=str,
+        default=None,
+        help="Directory with facade_train.txt / facade_val.txt. If set, random split is disabled.",
+    )
+    ap.add_argument(
+        "--train-split-file",
+        type=str,
+        default=None,
+        help="Train split filename inside --splits-dir (default: auto-detect).",
+    )
+    ap.add_argument(
+        "--val-split-file",
+        type=str,
+        default=None,
+        help="Val split filename inside --splits-dir (default: auto-detect).",
+    )
+
     ap.add_argument("--val-ratio", type=float, default=0.2)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--max-files", type=int, default=0)
@@ -688,11 +776,23 @@ def main() -> None:
 
     label_vocab = int(args.label_vocab) if int(args.label_vocab) > 0 else int(max_label_all + 1)
     max_len_support = int(args.max_len_support) if int(args.max_len_support) > 0 else int(max_width_all)
-
     alphabet_size = label_vocab + max_len_support
 
     facade_ids = [fid for fid, _ in items]
-    split = split_facades(facade_ids, val_ratio=args.val_ratio, seed=args.seed)
+
+    if args.splits_dir is not None:
+        split = load_splits(
+            Path(args.splits_dir),
+            train_split_file=args.train_split_file,
+            val_split_file=args.val_split_file,
+        )
+        save_used_splits(out_dir, split)
+        print(f"[Split] loaded from: {args.splits_dir}")
+    else:
+        split = split_facades(facade_ids, val_ratio=args.val_ratio, seed=args.seed)
+        save_used_splits(out_dir, split)
+        print(f"[Split] random split (val_ratio={args.val_ratio}, seed={args.seed})")
+
     train_set = set(split.train_facades)
     val_set = set(split.val_facades)
 
@@ -704,7 +804,9 @@ def main() -> None:
     print(f"[Data] max_width_all={max_width_all} max_label_all={max_label_all}")
     print(f"[Vocab] label_vocab={label_vocab} max_len_support={max_len_support} alphabet_size={alphabet_size}")
 
-    train_token_rows = list(iter_token_rows_from_masks(train_items, label_vocab=label_vocab, max_len_support=max_len_support))
+    train_token_rows = list(
+        iter_token_rows_from_masks(train_items, label_vocab=label_vocab, max_len_support=max_len_support)
+    )
 
     if args.model == "ppm":
         model: SeqModel = PPMMethodC(max_order=args.max_order, alphabet_size=alphabet_size)

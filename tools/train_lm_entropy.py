@@ -7,6 +7,7 @@ import random
 from pathlib import Path
 import sys
 import time
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -33,19 +34,103 @@ from maskscomp.lm_entropy import (
 from maskscomp.utils.msdzip_windows import compute_msdzip_window_loss_stats
 
 
+def _read_id_list(path: Path) -> List[str]:
+    if not path.exists():
+        raise FileNotFoundError(f"Split list not found: {path}")
+    out: List[str] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        out.append(s)
+    # de-dup while preserving order
+    seen = set()
+    uniq: List[str] = []
+    for x in out:
+        if x in seen:
+            continue
+        seen.add(x)
+        uniq.append(x)
+    return uniq
+
+
+def _pick_existing(dir_path: Path, preferred_name: Optional[str], candidates: Sequence[str]) -> Path:
+    if preferred_name:
+        p = dir_path / preferred_name
+        if p.exists():
+            return p
+        raise FileNotFoundError(f"Requested split file does not exist: {p}")
+
+    for name in candidates:
+        p = dir_path / name
+        if p.exists():
+            return p
+    raise FileNotFoundError(
+        "Could not find split files in splits-dir. Looked for: "
+        + ", ".join(str(dir_path / c) for c in candidates)
+    )
+
+
+def load_splits(
+    splits_dir: Path,
+    train_split_file: Optional[str] = None,
+    val_split_file: Optional[str] = None,
+) -> Tuple[List[str], List[str]]:
+    splits_dir = Path(splits_dir)
+    train_path = _pick_existing(splits_dir, train_split_file, ["facade_train.txt", "train.txt", "split_train.txt"])
+    val_path = _pick_existing(splits_dir, val_split_file, ["facade_val.txt", "val.txt", "split_val.txt"])
+
+    train_ids = _read_id_list(train_path)
+    val_ids = _read_id_list(val_path)
+
+    # If there is overlap, keep val as-is and remove duplicates from train (safer for model selection).
+    overlap = set(train_ids).intersection(val_ids)
+    if overlap:
+        train_ids = [x for x in train_ids if x not in overlap]
+
+    return train_ids, val_ids
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train LM entropy model on row-wise RLE token stream")
     p.add_argument("--data-root", type=Path, required=True)
     p.add_argument("--subdir", type=str, default="warped_masks")
     p.add_argument("--out-dir", type=Path, required=True)
+
+    # Splits
+    p.add_argument(
+        "--splits-dir",
+        type=Path,
+        default=None,
+        help="Use precomputed split lists (facade_train.txt / facade_val.txt). "
+        "If set, --val-ratio/--seed splitting is ignored.",
+    )
+    p.add_argument(
+        "--train-split-file",
+        type=str,
+        default=None,
+        help="Train split filename inside --splits-dir (default: auto-detect).",
+    )
+    p.add_argument(
+        "--val-split-file",
+        type=str,
+        default=None,
+        help="Val split filename inside --splits-dir (default: auto-detect).",
+    )
+
+    # Fallback split (only when --splits-dir is not provided)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--val-ratio", type=float, default=0.2)
+
+    # Training
     p.add_argument("--wmax", type=int, default=None)
     p.add_argument("--epochs", type=int, default=5)
     p.add_argument("--batch-size", type=int, default=1024)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=1e-2)
     p.add_argument("--arch", choices=["transformer", "msdzip"], default="transformer")
+
+    # Transformer/MSDZip params
     p.add_argument("--d-model", type=int, default=256)
     p.add_argument("--n-layers", type=int, default=4)
     p.add_argument("--n-heads", type=int, default=4)
@@ -55,6 +140,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--hidden-dim", type=int, default=128)
     p.add_argument("--ffn-dim", type=int, default=256)
     p.add_argument("--layers", type=int, default=4)
+
     p.add_argument("--use-2d-context", action="store_true")
     p.add_argument("--device", type=str, default="cuda")
     return p.parse_args()
@@ -99,14 +185,42 @@ def main() -> None:
     label_to_idx = {lab: i for i, lab in enumerate(labels)}
     log(f"Derived: wmax={wmax} num_labels={len(labels)}")
 
-    train_facades, val_facades = split_facades([r.facade_id for r in records], args.val_ratio, args.seed)
+    # -----------------------------
+    # SPLITS (either fixed from --splits-dir, or random split)
+    # -----------------------------
+    if args.splits_dir is not None:
+        t = time.perf_counter()
+        train_facades, val_facades = load_splits(
+            args.splits_dir, train_split_file=args.train_split_file, val_split_file=args.val_split_file
+        )
+        log(
+            f"Loaded splits from {args.splits_dir} "
+            f"(train={len(train_facades)} val={len(val_facades)}), "
+            f"took {(time.perf_counter()-t):.2f}s"
+        )
+    else:
+        train_facades, val_facades = split_facades([r.facade_id for r in records], args.val_ratio, args.seed)
+        log(
+            f"Random split: train_facades={len(train_facades)} val_facades={len(val_facades)} "
+            f"(val_ratio={args.val_ratio})"
+        )
+
+    # Save the actual lists used for this run (provenance)
     split_dir = args.out_dir / "splits"
     save_split_lists(train_facades, val_facades, split_dir)
-    log(f"Split: train_facades={len(train_facades)} val_facades={len(val_facades)} (val_ratio={args.val_ratio})")
+    log(f"Saved splits to: {split_dir}")
 
-    train_records = [r for r in records if r.facade_id in set(train_facades)]
-    val_records = [r for r in records if r.facade_id in set(val_facades)]
+    train_set = set(train_facades)
+    val_set = set(val_facades)
+
+    train_records = [r for r in records if r.facade_id in train_set]
+    val_records = [r for r in records if r.facade_id in val_set]
     log(f"Split records: train_records={len(train_records)} val_records={len(val_records)}")
+
+    if len(train_records) == 0:
+        raise RuntimeError("Empty train split after filtering records. Check --splits-dir and --subdir.")
+    if len(val_records) == 0:
+        log("WARNING: Empty val split after filtering records (val_bbp will be meaningless).")
 
     no_above_idx = len(labels)
     log("Building row-wise token items (this can take a while on large masks)...")
@@ -172,31 +286,10 @@ def main() -> None:
     config["wmax"] = wmax
     config["max_seq_len"] = max_seq_len
     config["arch"] = args.arch
+    config["splits_used_dir"] = str(split_dir)
     dump_json(args.out_dir / "config.json", config)
 
     log("Saved config.json to: " + str(args.out_dir / "config.json"))
-    log(
-        "Derived config (key fields):\n"
-        + json.dumps(
-            {
-                "arch": config["arch"],
-                "wmax": config["wmax"],
-                "max_seq_len": config["max_seq_len"],
-                "num_labels": config["num_labels"],
-                "batch_size": config["batch_size"],
-                "lr": config["lr"],
-                "weight_decay": config["weight_decay"],
-                "epochs": config["epochs"],
-                "timesteps": config.get("timesteps"),
-                "vocab_dim": config.get("vocab_dim"),
-                "hidden_dim": config.get("hidden_dim"),
-                "ffn_dim": config.get("ffn_dim"),
-                "layers": config.get("layers"),
-            },
-            indent=2,
-            ensure_ascii=False,
-        )
-    )
     log(f"Preprocessing total: {(time.perf_counter()-t_total0):.2f}s. Entering training loop...")
 
     log_rows = []
