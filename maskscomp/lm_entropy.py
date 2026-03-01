@@ -15,6 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
+from maskscomp.models import MSDZipMaskLM
 from maskscomp.rle_tokenizer import encode_mask_to_row_tokens
 
 IGNORE_INDEX = -100
@@ -246,6 +247,70 @@ class LMEntropyModel(nn.Module):
         return self.label_head(hidden), self.len_head(hidden)
 
 
+def build_lm_model(
+    arch: str,
+    num_labels: int,
+    wmax: int,
+    max_seq_len: int,
+    use_2d_context: bool,
+    d_model: int = 128,
+    n_layers: int = 4,
+    n_heads: int = 4,
+    dropout: float = 0.1,
+    timesteps: int = 16,
+    vocab_dim: int = 16,
+    hidden_dim: int = 128,
+    ffn_dim: int = 256,
+    layers: int = 4,
+) -> nn.Module:
+    arch = str(arch).lower()
+    if arch == "transformer":
+        return LMEntropyModel(
+            num_labels=num_labels,
+            wmax=wmax,
+            d_model=d_model,
+            n_layers=n_layers,
+            n_heads=n_heads,
+            dropout=dropout,
+            max_seq_len=max_seq_len,
+            use_2d_context=use_2d_context,
+        )
+    if arch == "msdzip":
+        return MSDZipMaskLM(
+            num_labels=num_labels,
+            wmax=wmax,
+            timesteps=timesteps,
+            vocab_dim=vocab_dim,
+            hidden_dim=hidden_dim,
+            ffn_dim=ffn_dim,
+            layers=layers,
+            dropout=dropout,
+            use_2d_context=use_2d_context,
+        )
+    raise ValueError(f"Unknown arch={arch!r}")
+
+
+def build_model_from_checkpoint_config(cfg: Dict[str, object], use_2d_context: bool) -> nn.Module:
+    arch = str(cfg.get("arch", "transformer")).lower()
+    wmax = int(cfg["wmax"])
+    return build_lm_model(
+        arch=arch,
+        num_labels=len(cfg["labels"]),
+        wmax=wmax,
+        max_seq_len=int(cfg.get("max_seq_len", 2 * wmax + 2)),
+        use_2d_context=use_2d_context,
+        d_model=int(cfg.get("d_model", 256)),
+        n_layers=int(cfg.get("n_layers", 4)),
+        n_heads=int(cfg.get("n_heads", 4)),
+        dropout=float(cfg.get("dropout", 0.1)),
+        timesteps=int(cfg.get("timesteps", 16)),
+        vocab_dim=int(cfg.get("vocab_dim", 16)),
+        hidden_dim=int(cfg.get("hidden_dim", 128)),
+        ffn_dim=int(cfg.get("ffn_dim", 256)),
+        layers=int(cfg.get("layers", cfg.get("n_layers", 4))),
+    )
+
+
 def collate_rows(batch: Sequence[Dict[str, object]]) -> Dict[str, object]:
     max_len = max(len(item["input_tokens"]) for item in batch)
     bsz = len(batch)
@@ -295,7 +360,7 @@ def masked_length_nll_bits(len_logits: torch.Tensor, targets: torch.Tensor, rema
 
 
 def compute_shifted_token_bits(
-    model: LMEntropyModel,
+    model: nn.Module,
     batch: Dict[str, torch.Tensor],
     device: torch.device,
     use_2d_context: bool,
@@ -341,8 +406,113 @@ def compute_shifted_token_bits(
     }
 
 
+def _last_step_logits(logits: torch.Tensor) -> torch.Tensor:
+    if logits.ndim == 2:
+        return logits
+    if logits.ndim == 3:
+        return logits[:, -1, :]
+    raise ValueError(f"Unsupported logits shape: {tuple(logits.shape)}")
+
+
+def compute_msdzip_shifted_token_bits(
+    model: nn.Module,
+    batch: Dict[str, torch.Tensor],
+    device: torch.device,
+    use_2d_context: bool,
+    timesteps: int,
+) -> Dict[str, torch.Tensor]:
+    """Compute per-position next-token bits using fixed MSDZip context windows."""
+    input_tokens = batch["input_tokens"].to(device)
+    token_types = batch["token_types"].to(device)
+    rem_width = batch["rem_width"].to(device)
+    pad_mask = batch["pad_mask"].to(device)
+    above_label = batch["above_label"].to(device)
+    above_same = batch["above_same"].to(device)
+
+    bsz, seqlen = input_tokens.shape
+    out_len = max(0, seqlen - 1)
+    label_bits = torch.zeros((bsz, out_len), device=device)
+    len_bits = torch.zeros((bsz, out_len), device=device)
+
+    if out_len == 0:
+        zmask = torch.zeros((bsz, 0), dtype=torch.bool, device=device)
+        return {"label_bits": label_bits, "len_bits": len_bits, "label_pos": zmask, "len_pos": zmask}
+
+    bos_vals = input_tokens[:, :1]
+    no_above_vals = above_label[:, :1]
+
+    for t in range(out_len):
+        start = max(0, t - int(timesteps) + 1)
+        ctx_tokens = input_tokens[:, start : t + 1]
+        ctx_types = token_types[:, start : t + 1]
+        ctx_above_label = above_label[:, start : t + 1]
+        ctx_above_same = above_same[:, start : t + 1]
+        ctx_len = ctx_tokens.shape[1]
+
+        win_tokens = bos_vals.repeat(1, int(timesteps))
+        win_types = torch.full((bsz, int(timesteps)), fill_value=-1, dtype=torch.long, device=device)
+        win_above_label = no_above_vals.repeat(1, int(timesteps))
+        win_above_same = torch.zeros((bsz, int(timesteps)), dtype=torch.long, device=device)
+
+        win_tokens[:, -ctx_len:] = ctx_tokens
+        win_types[:, -ctx_len:] = ctx_types
+        win_above_label[:, -ctx_len:] = ctx_above_label
+        win_above_same[:, -ctx_len:] = ctx_above_same
+
+        win_pad = torch.zeros((bsz, int(timesteps)), dtype=torch.bool, device=device)
+        outputs = model(
+            win_tokens,
+            win_types,
+            win_pad,
+            above_label=win_above_label if use_2d_context else None,
+            above_same=win_above_same if use_2d_context else None,
+        )
+
+        tgt_ids = input_tokens[:, t + 1]
+        tgt_types = token_types[:, t + 1]
+        tgt_remw = rem_width[:, t + 1]
+        tgt_valid = ~pad_mask[:, t + 1]
+        label_pos_t = tgt_valid & (tgt_types == 0)
+        len_pos_t = tgt_valid & (tgt_types == 1)
+
+        if isinstance(outputs, tuple):
+            label_logits = _last_step_logits(outputs[0])
+            len_logits = _last_step_logits(outputs[1])
+
+            if label_pos_t.any():
+                label_log_probs = F.log_softmax(label_logits[label_pos_t], dim=-1)
+                label_idx = tgt_ids[label_pos_t].clamp(min=0, max=label_logits.shape[-1] - 1)
+                bits = -torch.gather(label_log_probs, -1, label_idx.unsqueeze(-1)).squeeze(-1) / math.log(2.0)
+                label_bits[label_pos_t, t] = bits
+
+            if len_pos_t.any():
+                len_bits_t = masked_length_nll_bits(
+                    len_logits[len_pos_t].unsqueeze(1),
+                    tgt_ids[len_pos_t].unsqueeze(1),
+                    tgt_remw[len_pos_t].unsqueeze(1),
+                ).squeeze(1)
+                len_bits[len_pos_t, t] = len_bits_t
+        else:
+            logits = _last_step_logits(outputs)
+            log_probs = F.log_softmax(logits, dim=-1)
+            idx = tgt_ids.clamp(min=0, max=logits.shape[-1] - 1)
+            bits_all = -torch.gather(log_probs, -1, idx.unsqueeze(-1)).squeeze(-1) / math.log(2.0)
+            bits_all = torch.where(tgt_valid, bits_all, torch.zeros_like(bits_all))
+            label_bits[:, t] = torch.where(label_pos_t, bits_all, torch.zeros_like(bits_all))
+            len_bits[:, t] = torch.where(len_pos_t, bits_all, torch.zeros_like(bits_all))
+
+    label_pos = (~pad_mask[:, 1:]) & (token_types[:, 1:] == 0)
+    len_pos = (~pad_mask[:, 1:]) & (token_types[:, 1:] == 1)
+    return {
+        "label_bits": label_bits,
+        "len_bits": len_bits,
+        "label_pos": label_pos,
+        "len_pos": len_pos,
+    }
+
+
 def compute_batch_losses(
-    model: LMEntropyModel,
+    model: nn.Module,
     batch: Dict[str, torch.Tensor],
     device: torch.device,
     use_2d_context: bool,

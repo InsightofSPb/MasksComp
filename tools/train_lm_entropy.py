@@ -14,8 +14,8 @@ if __package__ is None or __package__ == "":
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
 from maskscomp.lm_entropy import (
-    LMEntropyModel,
     RowTokenDataset,
+    build_lm_model,
     build_row_items,
     collect_images,
     compute_batch_losses,
@@ -26,6 +26,7 @@ from maskscomp.lm_entropy import (
     split_facades,
     write_csv,
 )
+from maskscomp.utils.msdzip_windows import compute_msdzip_window_loss_stats
 
 
 def parse_args() -> argparse.Namespace:
@@ -40,13 +41,21 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch-size", type=int, default=1024)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=1e-2)
-    p.add_argument("--d-model", type=int, default=128)
-    p.add_argument("--n-layers", type=int, default=2)
+    p.add_argument("--arch", choices=["transformer", "msdzip"], default="transformer")
+    p.add_argument("--d-model", type=int, default=256)
+    p.add_argument("--n-layers", type=int, default=4)
     p.add_argument("--n-heads", type=int, default=4)
     p.add_argument("--dropout", type=float, default=0.1)
+    p.add_argument("--timesteps", type=int, default=16)
+    p.add_argument("--vocab-dim", type=int, default=16)
+    p.add_argument("--hidden-dim", type=int, default=128)
+    p.add_argument("--ffn-dim", type=int, default=256)
+    p.add_argument("--layers", type=int, default=4)
     p.add_argument("--use-2d-context", action="store_true")
     p.add_argument("--device", type=str, default="cuda")
     return p.parse_args()
+
+
 
 
 def main() -> None:
@@ -93,15 +102,21 @@ def main() -> None:
     if track_cuda_memory:
         torch.cuda.reset_peak_memory_stats(device)
 
-    model = LMEntropyModel(
+    model = build_lm_model(
+        arch=args.arch,
         num_labels=len(labels),
         wmax=wmax,
+        max_seq_len=max_seq_len,
+        use_2d_context=args.use_2d_context,
         d_model=args.d_model,
         n_layers=args.n_layers,
         n_heads=args.n_heads,
         dropout=args.dropout,
-        max_seq_len=max_seq_len,
-        use_2d_context=args.use_2d_context,
+        timesteps=args.timesteps,
+        vocab_dim=args.vocab_dim,
+        hidden_dim=args.hidden_dim,
+        ffn_dim=args.ffn_dim,
+        layers=args.layers,
     ).to(device)
     optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
@@ -113,6 +128,7 @@ def main() -> None:
     config["label_to_idx"] = label_to_idx
     config["wmax"] = wmax
     config["max_seq_len"] = max_seq_len
+    config["arch"] = args.arch
     dump_json(args.out_dir / "config.json", config)
 
     log_rows = []
@@ -131,7 +147,12 @@ def main() -> None:
         train_pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs} [train]", leave=False)
         for batch in train_pbar:
             optim.zero_grad(set_to_none=True)
-            loss_label, loss_len, stats = compute_batch_losses(model, batch, device, args.use_2d_context)
+            if args.arch == "msdzip":
+                loss_label, loss_len, stats = compute_msdzip_window_loss_stats(
+                    model, batch, device, args.use_2d_context, args.timesteps
+                )
+            else:
+                loss_label, loss_len, stats = compute_batch_losses(model, batch, device, args.use_2d_context)
             loss = loss_label + loss_len
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -159,7 +180,12 @@ def main() -> None:
         with torch.no_grad():
             val_pbar = tqdm(val_loader, desc=f"Epoch {epoch}/{args.epochs} [val]", leave=False)
             for batch in val_pbar:
-                loss_label, loss_len, stats = compute_batch_losses(model, batch, device, args.use_2d_context)
+                if args.arch == "msdzip":
+                    loss_label, loss_len, stats = compute_msdzip_window_loss_stats(
+                        model, batch, device, args.use_2d_context, args.timesteps
+                    )
+                else:
+                    loss_label, loss_len, stats = compute_batch_losses(model, batch, device, args.use_2d_context)
                 val_loss_label += float(loss_label.item())
                 val_loss_len += float(loss_len.item())
                 val_bits += stats["bits_label"] + stats["bits_len"]
