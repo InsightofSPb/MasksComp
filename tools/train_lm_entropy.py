@@ -6,13 +6,17 @@ import json
 import random
 from pathlib import Path
 import sys
+import time
+
 import numpy as np
 import torch
 from tqdm.auto import tqdm
+
 if __package__ is None or __package__ == "":
     repo_root = Path(__file__).resolve().parents[1]
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
+
 from maskscomp.lm_entropy import (
     RowTokenDataset,
     build_lm_model,
@@ -56,8 +60,6 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-
-
 def main() -> None:
     args = parse_args()
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -68,24 +70,55 @@ def main() -> None:
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
+    def log(msg: str) -> None:
+        ts = time.strftime("%H:%M:%S")
+        print(f"[{ts}] {msg}", flush=True)
+
+    t_total0 = time.perf_counter()
+    log("Starting run")
+    log("Command: " + " ".join(sys.argv))
+    log("Args:\n" + json.dumps(vars(args), indent=2, ensure_ascii=False, default=str))
+
+    t = time.perf_counter()
     records = collect_images(args.data_root, subdir=args.subdir)
+    log(
+        f"collect_images: {len(records)} records from {args.data_root}/{args.subdir}, "
+        f"took {(time.perf_counter()-t):.2f}s"
+    )
+
+    t = time.perf_counter()
     max_w_data, labels = compute_dataset_stats(records)
+    log(
+        f"compute_dataset_stats: max_w_data={max_w_data} labels={len(labels)}, "
+        f"took {(time.perf_counter()-t):.2f}s"
+    )
     if not labels:
         raise RuntimeError("No valid masks found")
 
     wmax = int(args.wmax) if args.wmax is not None else int(max_w_data)
     label_to_idx = {lab: i for i, lab in enumerate(labels)}
+    log(f"Derived: wmax={wmax} num_labels={len(labels)}")
 
     train_facades, val_facades = split_facades([r.facade_id for r in records], args.val_ratio, args.seed)
     split_dir = args.out_dir / "splits"
     save_split_lists(train_facades, val_facades, split_dir)
+    log(f"Split: train_facades={len(train_facades)} val_facades={len(val_facades)} (val_ratio={args.val_ratio})")
 
     train_records = [r for r in records if r.facade_id in set(train_facades)]
     val_records = [r for r in records if r.facade_id in set(val_facades)]
+    log(f"Split records: train_records={len(train_records)} val_records={len(val_records)}")
 
     no_above_idx = len(labels)
+    log("Building row-wise token items (this can take a while on large masks)...")
+
+    t = time.perf_counter()
     train_rows = build_row_items(train_records, label_to_idx=label_to_idx, no_above_idx=no_above_idx)
+    log(f"build_row_items(train): rows={len(train_rows)}, took {(time.perf_counter()-t):.2f}s")
+
+    t = time.perf_counter()
     val_rows = build_row_items(val_records, label_to_idx=label_to_idx, no_above_idx=no_above_idx)
+    log(f"build_row_items(val): rows={len(val_rows)}, took {(time.perf_counter()-t):.2f}s")
+
     for row in train_rows + val_rows:
         if np.any((row.token_types == 1) & (row.tokens > wmax)):
             raise ValueError(f"Encountered run length > wmax ({wmax}) in {row.rel_path}")
@@ -95,9 +128,13 @@ def main() -> None:
 
     train_loader = make_loader(train_ds, batch_size=args.batch_size, shuffle=True)
     val_loader = make_loader(val_ds, batch_size=args.batch_size, shuffle=False)
+    log(f"Dataloaders: train_ds={len(train_ds)} val_ds={len(val_ds)} batch_size={args.batch_size}")
 
     max_seq_len = 2 * wmax + 2
     device = torch.device(args.device)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        log("WARNING: device=cuda requested but CUDA is not available; training will likely fail.")
+
     track_cuda_memory = device.type == "cuda" and torch.cuda.is_available()
     if track_cuda_memory:
         torch.cuda.reset_peak_memory_stats(device)
@@ -118,6 +155,12 @@ def main() -> None:
         ffn_dim=args.ffn_dim,
         layers=args.layers,
     ).to(device)
+    n_params = sum(p.numel() for p in model.parameters())
+    log(
+        f"Model: arch={args.arch} params={n_params/1e6:.2f}M "
+        f"use_2d_context={args.use_2d_context} max_seq_len={max_seq_len} device={device}"
+    )
+
     optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     config = vars(args).copy()
@@ -130,6 +173,31 @@ def main() -> None:
     config["max_seq_len"] = max_seq_len
     config["arch"] = args.arch
     dump_json(args.out_dir / "config.json", config)
+
+    log("Saved config.json to: " + str(args.out_dir / "config.json"))
+    log(
+        "Derived config (key fields):\n"
+        + json.dumps(
+            {
+                "arch": config["arch"],
+                "wmax": config["wmax"],
+                "max_seq_len": config["max_seq_len"],
+                "num_labels": config["num_labels"],
+                "batch_size": config["batch_size"],
+                "lr": config["lr"],
+                "weight_decay": config["weight_decay"],
+                "epochs": config["epochs"],
+                "timesteps": config.get("timesteps"),
+                "vocab_dim": config.get("vocab_dim"),
+                "hidden_dim": config.get("hidden_dim"),
+                "ffn_dim": config.get("ffn_dim"),
+                "layers": config.get("layers"),
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+    )
+    log(f"Preprocessing total: {(time.perf_counter()-t_total0):.2f}s. Entering training loop...")
 
     log_rows = []
     best_val = float("inf")
@@ -144,6 +212,7 @@ def main() -> None:
         train_loss_label = 0.0
         train_loss_len = 0.0
         n_batches = 0
+
         train_pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs} [train]", leave=False)
         for batch in train_pbar:
             optim.zero_grad(set_to_none=True)
@@ -153,6 +222,7 @@ def main() -> None:
                 )
             else:
                 loss_label, loss_len, stats = compute_batch_losses(model, batch, device, args.use_2d_context)
+
             loss = loss_label + loss_len
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -177,6 +247,7 @@ def main() -> None:
         val_loss_label = 0.0
         val_loss_len = 0.0
         val_batches = 0
+
         with torch.no_grad():
             val_pbar = tqdm(val_loader, desc=f"Epoch {epoch}/{args.epochs} [val]", leave=False)
             for batch in val_pbar:
@@ -186,6 +257,7 @@ def main() -> None:
                     )
                 else:
                     loss_label, loss_len, stats = compute_batch_losses(model, batch, device, args.use_2d_context)
+
                 val_loss_label += float(loss_label.item())
                 val_loss_len += float(loss_len.item())
                 val_bits += stats["bits_label"] + stats["bits_len"]
@@ -210,15 +282,10 @@ def main() -> None:
             "val_loss_len": val_loss_len / max(1, val_batches),
             "val_bbp": val_bbp,
         }
-        row["gpu_mem_allocated_mb"] = (
-            torch.cuda.memory_allocated(device) / (1024**2) if track_cuda_memory else None
-        )
-        row["gpu_mem_reserved_mb"] = (
-            torch.cuda.memory_reserved(device) / (1024**2) if track_cuda_memory else None
-        )
-        row["gpu_mem_peak_reserved_mb"] = (
-            torch.cuda.max_memory_reserved(device) / (1024**2) if track_cuda_memory else None
-        )
+        row["gpu_mem_allocated_mb"] = torch.cuda.memory_allocated(device) / (1024**2) if track_cuda_memory else None
+        row["gpu_mem_reserved_mb"] = torch.cuda.memory_reserved(device) / (1024**2) if track_cuda_memory else None
+        row["gpu_mem_peak_reserved_mb"] = torch.cuda.max_memory_reserved(device) / (1024**2) if track_cuda_memory else None
+
         log_rows.append(row)
         print(
             f"[Epoch {epoch}/{args.epochs}] "
