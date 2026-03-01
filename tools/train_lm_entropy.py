@@ -5,11 +5,14 @@ import argparse
 import json
 import random
 from pathlib import Path
-
+import sys
 import numpy as np
 import torch
 from tqdm.auto import tqdm
-
+if __package__ is None or __package__ == "":
+    repo_root = Path(__file__).resolve().parents[1]
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
 from maskscomp.lm_entropy import (
     LMEntropyModel,
     RowTokenDataset,
@@ -34,15 +37,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--val-ratio", type=float, default=0.2)
     p.add_argument("--wmax", type=int, default=None)
     p.add_argument("--epochs", type=int, default=5)
-    p.add_argument("--batch-size", type=int, default=64)
+    p.add_argument("--batch-size", type=int, default=512)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=1e-2)
-    p.add_argument("--d-model", type=int, default=128)
+    p.add_argument("--d-model", type=int, default=256)
     p.add_argument("--n-layers", type=int, default=4)
     p.add_argument("--n-heads", type=int, default=4)
     p.add_argument("--dropout", type=float, default=0.1)
     p.add_argument("--use-2d-context", action="store_true")
-    p.add_argument("--device", type=str, default="cpu")
+    p.add_argument("--device", type=str, default="cuda")
     return p.parse_args()
 
 

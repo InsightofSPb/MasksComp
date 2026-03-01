@@ -4,11 +4,14 @@ from __future__ import annotations
 import argparse
 import csv
 from pathlib import Path
-
+import sys
 import numpy as np
 import torch
 from tqdm import tqdm
-
+if __package__ is None or __package__ == "":
+    repo_root = Path(__file__).resolve().parents[1]
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
 from maskscomp.entropy_coding.lm_codec import OnlineConfig, encode_file
 from maskscomp.lm_entropy import collect_images, load_split_list, read_mask_png
 
