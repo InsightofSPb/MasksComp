@@ -124,3 +124,43 @@ PYTHONPATH=$(pwd) python tools/run_lm_codec_matrix.py \
   --splits-dir output/a2d2_lm/splits \
   --out-csv output/a2d2_lm/lm_matrix.csv
 ```
+
+## Change detection benchmark (conditional codelength)
+
+1. Build pair lists for train/val:
+
+```bash
+python tools/make_pairs.py --dataset a2d2 --data-root DS --subdir warped_masks --splits-dir DS/splits --delta 1 --out-dir OUT/pairs
+python tools/make_pairs.py --dataset facades --data-root DS_F --subdir warped_masks --splits-dir DS_F/splits --out-dir OUT/pairs
+```
+
+2. Build residual datasets (`C` and `V`):
+
+```bash
+python tools/build_residual_dataset.py --data-root DS --subdir warped_masks --pairs-csv OUT/pairs/a2d2_pairs_train.csv --out-root RES_A2D2
+```
+
+3. Benchmark conditional classic codecs:
+
+```bash
+python tools/bench_residual_codecs.py --data-root RES_A2D2 --splits-dir RES_A2D2/splits --split val --codecs lzma,zstd --levels 1,3,6,9 --out-csv OUT/conditional_classic/a2d2_residual_codecs.csv
+```
+
+4. Train/evaluate LM on `residual_C` and `residual_V` with existing `tools/train_lm_entropy.py` and `tools/eval_lm_entropy.py`, then merge:
+
+```bash
+python tools/merge_residual_lm.py --csv-c OUT/lm_resC/val_per_image.csv --csv-v OUT/lm_resV/val_per_image.csv --split val --out-csv OUT/conditional_nn/residual_lm_sum.csv
+```
+
+5. Tile surprise maps and metrics:
+
+```bash
+python tools/eval_change_tiles.py --mode classic_residual --data-root RES_A2D2 --pairs-csv OUT/pairs/a2d2_pairs_val.csv --split val --out-dir OUT/change_tiles/classic
+python tools/eval_change_metrics.py --data-root DS --pairs-csv OUT/pairs/a2d2_pairs_val.csv --heatmap-dir OUT/change_tiles/classic/heatmaps_tiles --dataset a2d2 --split val --method classic_residual --out OUT/change_tiles/classic/metrics_change_tiles.csv
+```
+
+6. Paper artifacts (tables + optional top-K render):
+
+```bash
+python tools/make_paper_artifacts.py --cond-csv OUT/conditional_nn/residual_lm_sum.csv --metrics-csv OUT/change_tiles/classic/metrics_change_tiles.csv --tiles-csv OUT/change_tiles/classic/change_tiles_scores.csv --heat-root OUT/change_tiles/classic/heatmaps_tiles --out-dir output --render-topk 10
+```
