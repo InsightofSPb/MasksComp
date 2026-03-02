@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-
+import sys
 import argparse
 import logging
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Tuple
-
+if __package__ is None or __package__ == "":
+    repo_root = Path(__file__).resolve().parents[1]
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
 from maskscomp.change_detection import (
     PairRecord,
     configure_logging,

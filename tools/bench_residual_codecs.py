@@ -5,7 +5,11 @@ import argparse
 import csv
 import logging
 from pathlib import Path
-
+import sys 
+if __package__ is None or __package__ == "":
+    repo_root = Path(__file__).resolve().parents[1]
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
 from maskscomp.change_detection import (
     compress_bytes,
     configure_logging,
