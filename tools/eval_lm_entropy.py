@@ -10,6 +10,13 @@ from pathlib import Path
 import numpy as np
 import torch
 
+# tqdm (если вдруг не установлен — скрипт просто продолжит без прогресс-бара)
+try:
+    from tqdm.auto import tqdm
+except Exception:  # pragma: no cover
+    def tqdm(x, **kwargs):  # type: ignore
+        return x
+
 from maskscomp.lm_entropy import (
     CachedRowTokenDataset,
     RowTokenDataset,
@@ -107,6 +114,7 @@ def main() -> None:
                 raise ValueError(f"Encountered run length > wmax ({wmax}) in {row.rel_path}")
 
         ds = RowTokenDataset(rows, label_bos_idx=no_above_idx, no_above_idx=no_above_idx)
+
     loader = make_loader(ds, batch_size=args.batch_size, shuffle=False)
 
     model = build_model_from_checkpoint_config(cfg, use_2d_context=use_2d_context)
@@ -114,12 +122,27 @@ def main() -> None:
     device = torch.device(args.device)
     model.to(device)
     model.eval()
+
     is_msdzip = bool(ckpt_arch == "msdzip") or hasattr(model, "timesteps")
     timesteps = int(args.timesteps) if args.timesteps is not None else int(getattr(model, "timesteps", cfg.get("timesteps", 16)))
 
     per_image = defaultdict(lambda: {"bits_label": 0.0, "bits_len": 0.0, "H": 0, "W": 0, "facade_id": "", "rel_path": ""})
+
+    # --- tqdm total (если len(loader) не определён, tqdm будет без total) ---
+    try:
+        total_batches = len(loader)
+    except Exception:
+        total_batches = None
+
     with torch.no_grad():
-        for batch in loader:
+        pbar = tqdm(
+            loader,
+            total=total_batches,
+            desc=f"Eval {args.split}",
+            unit="batch",
+            mininterval=0.5,
+        )
+        for batch in pbar:
             if is_msdzip:
                 out = compute_msdzip_shifted_token_bits(model, batch, device, use_2d_context, timesteps=timesteps)
             else:
@@ -136,6 +159,9 @@ def main() -> None:
                 per_image[key]["W"] = meta.W
                 per_image[key]["facade_id"] = meta.facade_id
                 per_image[key]["rel_path"] = meta.rel_path
+
+            # полезно видеть, сколько уникальных изображений уже “собрали”
+            pbar.set_postfix(images=len(per_image))
 
     rows_csv = []
     bbps_total = []

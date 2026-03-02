@@ -760,4 +760,4 @@ def write_csv(path: Path, fieldnames: Sequence[str], rows: Iterable[Dict[str, ob
 
 def dump_json(path: Path, obj: Dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(obj, indent=2, sort_keys=True), encoding="utf-8")
+    path.write_text(json.dumps(obj, indent=2, sort_keys=True, default=str), encoding="utf-8")
