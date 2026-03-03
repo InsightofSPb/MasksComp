@@ -25,6 +25,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tau", type=float, default=0.01)
     p.add_argument("--topk", type=int, default=5)
     p.add_argument("--out", type=Path, required=True)
+    p.add_argument("--label-from", choices=["residual_C", "masks"], default="residual_C")
+    p.add_argument("--append", action="store_true")
+    p.add_argument("--ids-txt", type=Path, default=None)
+    p.add_argument("--max-items", type=int, default=None)
     return p.parse_args()
 
 
@@ -40,23 +44,58 @@ def _safe_ap(labels: np.ndarray, scores: np.ndarray) -> float:
     return float(average_precision_score(labels, scores))
 
 
+def _load_ids(ids_txt: Path) -> set[str]:
+    ids = set()
+    for ln in ids_txt.read_text(encoding="utf-8").splitlines():
+        s = ln.strip()
+        if s:
+            ids.add(s)
+    return ids
+
+
+def _get_write_mode(out_path: Path, append: bool) -> tuple[str, bool]:
+    if not append:
+        return "w", True
+    if not out_path.exists():
+        return "w", True
+    if out_path.stat().st_size == 0:
+        return "w", True
+
+    with out_path.open("r", encoding="utf-8", newline="") as f:
+        has_header = bool(f.readline().strip())
+    return "a", not has_header
+
+
 def main() -> None:
     args = parse_args()
     rows = [r for r in read_pairs_csv(args.pairs_csv) if r.split == args.split]
+
+    if args.ids_txt is not None:
+        keep = _load_ids(args.ids_txt)
+        rows = [r for r in rows if str(r.pair_id) in keep]
+    if args.max_items is not None:
+        rows = rows[: int(args.max_items)]
+
     all_scores: List[float] = []
     all_labels: List[int] = []
     hit_count = 0
     recall_num = 0
     recall_den = 0
+    evaluated_rows = 0
 
     for r in rows:
-        heat_path = args.heatmap_dir / r.sample_id / f"{Path(r.cur_path).stem}.npy"
+        heat_path = args.heatmap_dir / r.pair_id / f"{Path(r.cur_path).stem}.npy"
         if not heat_path.exists():
             continue
         heat = np.load(heat_path)
-        prev = read_mask(args.data_root / r.prev_path)
-        cur = read_mask(args.data_root / r.cur_path)
-        diff = (cur != prev).astype(np.uint8)
+        stem = Path(r.cur_path).stem
+        if args.label_from == "residual_C":
+            c = read_mask(args.data_root / r.pair_id / "residual_C" / f"{stem}.png")
+            diff = (c != 0).astype(np.uint8)
+        else:
+            prev = read_mask(args.data_root / r.prev_path)
+            cur = read_mask(args.data_root / r.cur_path)
+            diff = (cur != prev).astype(np.uint8)
 
         labels = []
         for _y, _x, tile in iter_tiles_2d(diff, args.tile_size, args.stride):
@@ -76,6 +115,7 @@ def main() -> None:
         hit_count += int(labels[top_idx].any()) if k > 0 else 0
         recall_num += int(labels[top_idx].sum()) if k > 0 else 0
         recall_den += int(labels.sum())
+        evaluated_rows += 1
 
     y = np.asarray(all_labels, dtype=np.int64)
     s = np.asarray(all_scores, dtype=np.float64)
@@ -83,17 +123,21 @@ def main() -> None:
         "dataset": args.dataset,
         "split": args.split,
         "method": args.method,
+        "label_from": args.label_from,
         "tau": args.tau,
         "ROC-AUC": _safe_auc(y, s),
         "PR-AUC": _safe_ap(y, s),
-        "Hit@K": float(hit_count) / max(1, len(rows)),
+        "Hit@K": float(hit_count) / max(1, evaluated_rows),
         "Recall@K": float(recall_num) / max(1, recall_den),
+        "n_pairs": int(evaluated_rows),
     }
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    with args.out.open("w", newline="", encoding="utf-8") as f:
+    mode, write_header = _get_write_mode(args.out, args.append)
+    with args.out.open(mode, newline="", encoding="utf-8") as f:
         wr = csv.DictWriter(f, fieldnames=list(metrics.keys()))
-        wr.writeheader()
+        if write_header:
+            wr.writeheader()
         wr.writerow(metrics)
     print(f"[OK] wrote {args.out}")
 

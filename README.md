@@ -164,3 +164,72 @@ python tools/eval_change_metrics.py --data-root DS --pairs-csv OUT/pairs/a2d2_pa
 ```bash
 python tools/make_paper_artifacts.py --cond-csv OUT/conditional_nn/residual_lm_sum.csv --metrics-csv OUT/change_tiles/classic/metrics_change_tiles.csv --tiles-csv OUT/change_tiles/classic/change_tiles_scores.csv --heat-root OUT/change_tiles/classic/heatmaps_tiles --out-dir output --render-topk 10
 ```
+
+## Recommended MSDZip tile protocols (A2D2 residual)
+
+### B-mode (global eval → run dumps → tile heatmaps)
+
+```bash
+cd /home/sasha/MasksComp
+export PYTHONPATH=$(pwd)
+
+RES_ALL=results_a2d2/all
+PAIRS=output/a2d2_msdzip_cached/pairs/a2d2_pairs_val.csv
+OUTV=/home/sasha/MasksComp/results_a2d2_conditional/conditional_nn/lm_resV
+CKPTV=$OUTV/checkpoints/best.pt
+DUMP=$OUTV/run_bits_val
+
+python tools/eval_lm_entropy.py \
+  --data-root "$RES_ALL" --subdir residual_V \
+  --checkpoint "$CKPTV" \
+  --splits-dir "$RES_ALL/splits" --split val \
+  --arch msdzip --timesteps 16 \
+  --out-csv "$OUTV/val_per_image.csv" \
+  --dump-run-bits-dir "$DUMP" \
+  --batch-size 256 --device cuda
+
+OUT_B=/home/sasha/MasksComp/results_a2d2_conditional/change_tiles/a2d2_B_msdzipV_decomp_t64_s32
+python tools/run_bits_to_tile_heatmaps.py \
+  --run-bits-dir "$DUMP" \
+  --pairs-csv "$PAIRS" \
+  --split val \
+  --tile-size 64 --stride 32 \
+  --out-dir "$OUT_B"
+
+python tools/eval_change_metrics.py \
+  --data-root "$RES_ALL" \
+  --pairs-csv "$PAIRS" \
+  --heatmap-dir "$OUT_B/heatmaps_tiles" \
+  --dataset a2d2 --split val --method msdzip_B_t64_s32 \
+  --tile-size 64 --stride 32 --tau 0.01 --topk 5 \
+  --label-from residual_C \
+  --out /home/sasha/MasksComp/results_a2d2_conditional/metrics/a2d2_val_msdzipB_t64_s32.csv
+```
+
+### A-mode (tile-reset per tile)
+
+```bash
+TILE_DS=/home/sasha/MasksComp/results_a2d2_conditional/tile_ds/a2d2_val_resV_t64_s64_top50
+python tools/make_tile_dataset.py \
+  --data-root results_a2d2/all \
+  --pairs-csv output/a2d2_msdzip_cached/pairs/a2d2_pairs_val.csv \
+  --split val \
+  --ids-txt /home/sasha/MasksComp/results_a2d2_conditional/subsets/a2d2_val_top50_by_hybrid.txt \
+  --src-subdir residual_V \
+  --tile-size 64 --stride 64 \
+  --out-root "$TILE_DS"
+
+OUT_A_NN=/home/sasha/MasksComp/results_a2d2_conditional/change_tiles/a2d2_A_msdzip_tileReset_t64_s64_top50
+python tools/eval_lm_entropy.py \
+  --data-root "$TILE_DS" --subdir tiles \
+  --checkpoint /home/sasha/MasksComp/results_a2d2_conditional/conditional_nn/lm_resV/checkpoints/best.pt \
+  --splits-dir "$TILE_DS/splits" --split val \
+  --arch msdzip --timesteps 16 \
+  --out-csv "$OUT_A_NN/val_tiles_per_image.csv" \
+  --batch-size 256 --device cuda
+
+python tools/tiles_eval_to_heatmaps.py \
+  --tile-ds-root "$TILE_DS" \
+  --tiles-eval-csv "$OUT_A_NN/val_tiles_per_image.csv" \
+  --out-dir "$OUT_A_NN"
+```

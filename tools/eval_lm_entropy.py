@@ -49,6 +49,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--row-cache-dir", type=Path, default=None)
     p.add_argument("--row-cache-manifest", type=Path, default=None)
     p.add_argument("--row-cache-lru-size", type=int, default=8)
+    p.add_argument("--dump-run-bits-dir", type=Path, default=None)
     return p.parse_args()
 
 
@@ -127,6 +128,7 @@ def main() -> None:
     timesteps = int(args.timesteps) if args.timesteps is not None else int(getattr(model, "timesteps", cfg.get("timesteps", 16)))
 
     per_image = defaultdict(lambda: {"bits_label": 0.0, "bits_len": 0.0, "H": 0, "W": 0, "facade_id": "", "rel_path": ""})
+    per_image_runs = defaultdict(lambda: {"H": 0, "W": 0, "y": [], "start": [], "length": [], "bits_run": []})
 
     # --- tqdm total (если len(loader) не определён, tqdm будет без total) ---
     try:
@@ -150,6 +152,11 @@ def main() -> None:
 
             row_bits_label = out["label_bits"].sum(dim=1).cpu().numpy()
             row_bits_len = out["len_bits"].sum(dim=1).cpu().numpy()
+            row_label_bits = out["label_bits"].cpu().numpy()
+            row_len_bits = out["len_bits"].cpu().numpy()
+            in_tokens = batch["input_tokens"].cpu().numpy()
+            token_types = batch["token_types"].cpu().numpy()
+            pad_mask = batch["pad_mask"].cpu().numpy()
 
             for i, meta in enumerate(batch["meta"]):
                 key = (meta.facade_id, meta.rel_path)
@@ -159,6 +166,31 @@ def main() -> None:
                 per_image[key]["W"] = meta.W
                 per_image[key]["facade_id"] = meta.facade_id
                 per_image[key]["rel_path"] = meta.rel_path
+
+                if args.dump_run_bits_dir is not None:
+                    valid = ~pad_mask[i, 1:]
+                    tgt_tokens = in_tokens[i, 1:][valid]
+                    tgt_types = token_types[i, 1:][valid]
+                    label_bits_seq = row_label_bits[i, : valid.sum()]
+                    len_bits_seq = row_len_bits[i, : valid.sum()]
+
+                    x_cursor = 0
+                    pending_label_bits = 0.0
+                    runs = per_image_runs[key]
+                    runs["H"] = int(meta.H)
+                    runs["W"] = int(meta.W)
+                    for tok, ttype, b_lbl, b_len in zip(tgt_tokens, tgt_types, label_bits_seq, len_bits_seq):
+                        if int(ttype) == 0:
+                            pending_label_bits = float(b_lbl)
+                        elif int(ttype) == 1:
+                            run_len = int(tok)
+                            if run_len <= 0:
+                                continue
+                            runs["y"].append(int(meta.y))
+                            runs["start"].append(int(x_cursor))
+                            runs["length"].append(run_len)
+                            runs["bits_run"].append(float(pending_label_bits + float(b_len)))
+                            x_cursor += run_len
 
             # полезно видеть, сколько уникальных изображений уже “собрали”
             pbar.set_postfix(images=len(per_image))
@@ -213,6 +245,36 @@ def main() -> None:
         )
         wr.writeheader()
         wr.writerows(rows_csv)
+
+    if args.dump_run_bits_dir is not None:
+        args.dump_run_bits_dir.mkdir(parents=True, exist_ok=True)
+        for (facade_id, rel_path), runs in sorted(per_image_runs.items()):
+            stem = Path(rel_path).stem
+            out_dir = args.dump_run_bits_dir / facade_id
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out_path = out_dir / f"{stem}.npz"
+
+            if len(runs["y"]) > 0:
+                order = np.lexsort((np.asarray(runs["start"]), np.asarray(runs["y"])))
+                y = np.asarray(runs["y"], dtype=np.int32)[order]
+                start = np.asarray(runs["start"], dtype=np.int32)[order]
+                length = np.asarray(runs["length"], dtype=np.int32)[order]
+                bits_run = np.asarray(runs["bits_run"], dtype=np.float32)[order]
+            else:
+                y = np.zeros((0,), dtype=np.int32)
+                start = np.zeros((0,), dtype=np.int32)
+                length = np.zeros((0,), dtype=np.int32)
+                bits_run = np.zeros((0,), dtype=np.float32)
+
+            np.savez_compressed(
+                out_path,
+                H=np.asarray(int(runs["H"]), dtype=np.int32),
+                W=np.asarray(int(runs["W"]), dtype=np.int32),
+                y=y,
+                start=start,
+                length=length,
+                bits_run=bits_run,
+            )
 
     summary = {
         "split": args.split,
