@@ -34,6 +34,8 @@ def _load_ids(ids_txt: Path) -> set[str]:
 
 def main() -> None:
     args = parse_args()
+    if args.stride != args.tile_size:
+        raise SystemExit("For tile-reset protocol use stride == tile-size (non-overlapping tiles).")
     rows = [r for r in read_pairs_csv(args.pairs_csv) if r.split == args.split]
     if args.ids_txt is not None:
         keep = _load_ids(args.ids_txt)
