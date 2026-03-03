@@ -18,6 +18,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tile-size", type=int, required=True)
     p.add_argument("--stride", type=int, required=True)
     p.add_argument("--out-dir", type=Path, required=True)
+    p.add_argument("--ids-txt", type=Path, default=None)
+    p.add_argument("--max-items", type=int, default=None)
     return p.parse_args()
 
 
@@ -32,14 +34,29 @@ def _tile_heat_from_density(density: np.ndarray, tile_size: int, stride: int) ->
         y1 = y0 + tile_size
         x0 = np.arange(gw, dtype=np.int64) * stride
         x1 = x0 + tile_size
-        s = integ[y1, x1] - integ[y0, x1] - integ[y1, x0] + integ[y0, x0]
-        heat[gy, :] = (s / area).astype(np.float32)
+        sums = integ[y1, x1] - integ[y0, x1] - integ[y1, x0] + integ[y0, x0]
+        heat[gy, :] = (sums / area).astype(np.float32)
     return heat
+
+
+def _load_ids(ids_txt: Path) -> set[str]:
+    ids = set()
+    for ln in ids_txt.read_text(encoding="utf-8").splitlines():
+        s = ln.strip()
+        if s:
+            ids.add(s)
+    return ids
 
 
 def main() -> None:
     args = parse_args()
     rows = [r for r in read_pairs_csv(args.pairs_csv) if r.split == args.split]
+
+    if args.ids_txt is not None:
+        keep = _load_ids(args.ids_txt)
+        rows = [r for r in rows if str(r.pair_id) in keep]
+    if args.max_items is not None:
+        rows = rows[: int(args.max_items)]
 
     heat_root = args.out_dir / "heatmaps_tiles"
     heat_root.mkdir(parents=True, exist_ok=True)
@@ -69,8 +86,8 @@ def main() -> None:
                 continue
 
             with np.load(src, allow_pickle=False) as z:
-                h = int(z["H"]) if np.ndim(z["H"]) == 0 else int(np.asarray(z["H"]).reshape(-1)[0])
-                w = int(z["W"]) if np.ndim(z["W"]) == 0 else int(np.asarray(z["W"]).reshape(-1)[0])
+                h = int(np.asarray(z["H"]).reshape(-1)[0])
+                w = int(np.asarray(z["W"]).reshape(-1)[0])
                 y = z["y"].astype(np.int64, copy=False)
                 start = z["start"].astype(np.int64, copy=False)
                 length = z["length"].astype(np.int64, copy=False)

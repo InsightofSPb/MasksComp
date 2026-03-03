@@ -27,6 +27,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--label-from", choices=["residual_C", "masks"], default="residual_C")
     p.add_argument("--append", action="store_true")
+    p.add_argument("--ids-txt", type=Path, default=None)
+    p.add_argument("--max-items", type=int, default=None)
     return p.parse_args()
 
 
@@ -42,9 +44,38 @@ def _safe_ap(labels: np.ndarray, scores: np.ndarray) -> float:
     return float(average_precision_score(labels, scores))
 
 
+def _load_ids(ids_txt: Path) -> set[str]:
+    ids = set()
+    for ln in ids_txt.read_text(encoding="utf-8").splitlines():
+        s = ln.strip()
+        if s:
+            ids.add(s)
+    return ids
+
+
+def _get_write_mode(out_path: Path, append: bool) -> tuple[str, bool]:
+    if not append:
+        return "w", True
+    if not out_path.exists():
+        return "w", True
+    if out_path.stat().st_size == 0:
+        return "w", True
+
+    with out_path.open("r", encoding="utf-8", newline="") as f:
+        has_header = bool(f.readline().strip())
+    return "a", not has_header
+
+
 def main() -> None:
     args = parse_args()
     rows = [r for r in read_pairs_csv(args.pairs_csv) if r.split == args.split]
+
+    if args.ids_txt is not None:
+        keep = _load_ids(args.ids_txt)
+        rows = [r for r in rows if str(r.pair_id) in keep]
+    if args.max_items is not None:
+        rows = rows[: int(args.max_items)]
+
     all_scores: List[float] = []
     all_labels: List[int] = []
     hit_count = 0
@@ -102,10 +133,10 @@ def main() -> None:
     }
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    mode = "a" if args.append and args.out.exists() else "w"
+    mode, write_header = _get_write_mode(args.out, args.append)
     with args.out.open(mode, newline="", encoding="utf-8") as f:
         wr = csv.DictWriter(f, fieldnames=list(metrics.keys()))
-        if mode == "w":
+        if write_header:
             wr.writeheader()
         wr.writerow(metrics)
     print(f"[OK] wrote {args.out}")
