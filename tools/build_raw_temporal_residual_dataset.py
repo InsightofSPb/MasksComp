@@ -13,9 +13,11 @@ from maskscomp.raw_temporal import (
     iter_tiles,
     modular_residual,
     png_size_bytes,
+    read_geom_metadata,
     read_homography,
     read_pairs_csv,
     read_rgb,
+    resolve_prealigned_assets,
     serialize_tile,
     write_rgb,
 )
@@ -23,16 +25,32 @@ from maskscomp.raw_temporal import (
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Build raw temporal residual tile dataset")
-    p.add_argument("--data-root", type=Path, required=True)
     p.add_argument("--pairs-csv", type=Path, required=True)
     p.add_argument("--out-root", type=Path, required=True)
+    p.add_argument("--alignment-mode", choices=["precomputed", "homography"], default="precomputed")
+
+    p.add_argument("--prealigned-root", type=Path, default=None)
+    p.add_argument("--geom-root", type=Path, default=None)
+    p.add_argument("--data-root", type=Path, default=None, help="Only used in homography mode or for relative paths")
+
     p.add_argument("--tile-size", type=int, default=64)
     p.add_argument("--stride", type=int, default=32)
     p.add_argument("--min-valid-fraction", type=float, default=0.5)
     p.add_argument("--serialize", choices=["interleaved", "planar"], default="interleaved")
     p.add_argument("--png-level", type=int, default=6)
     p.add_argument("--write-viz", action=argparse.BooleanOptionalAction, default=True)
+
+    p.add_argument("--require-strong-geom", action=argparse.BooleanOptionalAction, default=False)
     return p.parse_args()
+
+
+def _resolve_path(p: str, data_root: Path | None) -> Path:
+    x = Path(p)
+    if x.is_absolute():
+        return x
+    if data_root is None:
+        return x
+    return data_root / x
 
 
 def _read_valid_mask(path: Path, shape_hw: tuple[int, int]) -> np.ndarray:
@@ -48,23 +66,54 @@ def _read_valid_mask(path: Path, shape_hw: tuple[int, int]) -> np.ndarray:
 
 def main() -> None:
     args = parse_args()
+    if args.alignment_mode == "precomputed" and args.prealigned_root is None:
+        raise ValueError("--prealigned-root is required for --alignment-mode precomputed")
+
     args.out_root.mkdir(parents=True, exist_ok=True)
     (args.out_root / "tiles").mkdir(parents=True, exist_ok=True)
 
     pairs = read_pairs_csv(args.pairs_csv)
     tile_rows = []
+    pair_rows = []
 
     split_map: dict[str, list[str]] = {}
     for rec in pairs:
-        prev = read_rgb(args.data_root / rec.prev_path)
-        cur = read_rgb(args.data_root / rec.cur_path)
-        hh = read_homography(args.data_root / rec.homography_path) if rec.homography_path else None
-        prev_aligned = align_prev_to_cur(prev, cur.shape[:2], hh)
-        residual = modular_residual(cur, prev_aligned)
+        geom = read_geom_metadata(args.geom_root, rec)
+        if args.require_strong_geom and str(geom.get("status_quality", "")) != "strong":
+            continue
 
-        valid_mask = None
-        if rec.valid_mask_path:
-            valid_mask = _read_valid_mask(args.data_root / rec.valid_mask_path, cur.shape[:2])
+        if args.alignment_mode == "precomputed":
+            resolved = resolve_prealigned_assets(args.prealigned_root, rec)
+            prev_aligned = read_rgb(Path(resolved["prev_aligned_rgb"]))
+            cur = read_rgb(Path(resolved["cur_rgb"]))
+            valid_mask = None
+            if resolved.get("valid_mask"):
+                valid_mask = _read_valid_mask(Path(resolved["valid_mask"]), cur.shape[:2])
+        else:
+            prev = read_rgb(_resolve_path(rec.prev_path, args.data_root))
+            cur = read_rgb(_resolve_path(rec.cur_path, args.data_root))
+            hh = read_homography(_resolve_path(rec.homography_path, args.data_root)) if rec.homography_path else None
+            prev_aligned = align_prev_to_cur(prev, cur.shape[:2], hh)
+            valid_mask = None
+            if rec.valid_mask_path:
+                valid_mask = _read_valid_mask(_resolve_path(rec.valid_mask_path, args.data_root), cur.shape[:2])
+            resolved = {
+                "prev_aligned_rgb": str(_resolve_path(rec.prev_path, args.data_root)),
+                "cur_rgb": str(_resolve_path(rec.cur_path, args.data_root)),
+                "valid_mask": str(_resolve_path(rec.valid_mask_path, args.data_root)) if rec.valid_mask_path else "",
+                "superpixel_labels": rec.superpixel_labels_path,
+                "overlay_viz": "",
+                "facade_dir": "",
+            }
+
+        if prev_aligned.shape[:2] != cur.shape[:2]:
+            raise ValueError(
+                f"Resolved aligned pair shape mismatch for pair_id={rec.pair_id} "
+                f"facade_id={rec.facade_id} year_a={rec.year_a} year_b={rec.year_b}: "
+                f"prev_aligned={prev_aligned.shape} cur={cur.shape}"
+            )
+
+        residual = modular_residual(cur, prev_aligned)
 
         pair_dir = args.out_root / "pairs" / rec.pair_id
         pair_dir.mkdir(parents=True, exist_ok=True)
@@ -93,7 +142,10 @@ def main() -> None:
             tile_rows.append(
                 {
                     "pair_id": rec.pair_id,
+                    "facade_id": rec.facade_id,
                     "sample_id": rec.sample_id,
+                    "year_a": rec.year_a,
+                    "year_b": rec.year_b,
                     "split": rec.split,
                     "tile_y": y,
                     "tile_x": x,
@@ -101,6 +153,7 @@ def main() -> None:
                     "tile_w": args.tile_size,
                     "valid_fraction": frac,
                     "png_bytes": png_bytes[-1],
+                    "status_quality": geom.get("status_quality", ""),
                 }
             )
 
@@ -118,6 +171,32 @@ def main() -> None:
                 W=np.int32(cur.shape[1]),
             )
 
+        pair_rows.append(
+            {
+                "pair_id": rec.pair_id,
+                "facade_id": rec.facade_id,
+                "sample_id": rec.sample_id,
+                "year_a": rec.year_a,
+                "year_b": rec.year_b,
+                "split": rec.split,
+                "alignment_mode": args.alignment_mode,
+                "prealigned_facade_dir": resolved.get("facade_dir", ""),
+                "resolved_prev_aligned_rgb": resolved.get("prev_aligned_rgb", ""),
+                "resolved_cur_rgb": resolved.get("cur_rgb", ""),
+                "resolved_valid_mask": resolved.get("valid_mask", ""),
+                "resolved_superpixel_labels": resolved.get("superpixel_labels", ""),
+                "resolved_overlay_viz": resolved.get("overlay_viz", ""),
+                "num_matches": geom.get("num_matches", ""),
+                "num_inliers": geom.get("num_inliers", ""),
+                "inlier_ratio": geom.get("inlier_ratio", ""),
+                "iou_fg": geom.get("iou_fg", ""),
+                "iou_edge": geom.get("iou_edge", ""),
+                "status_quality": geom.get("status_quality", ""),
+                "geom_path": geom.get("geom_path", ""),
+                "n_tiles": len(seqs),
+            }
+        )
+
         split_map.setdefault(rec.split, []).append(rec.pair_id)
 
     with (args.out_root / "tile_metadata.csv").open("w", newline="", encoding="utf-8") as f:
@@ -125,6 +204,12 @@ def main() -> None:
         wr.writeheader()
         if tile_rows:
             wr.writerows(tile_rows)
+
+    with (args.out_root / "pair_metadata.csv").open("w", newline="", encoding="utf-8") as f:
+        wr = csv.DictWriter(f, fieldnames=list(pair_rows[0].keys()) if pair_rows else ["pair_id"])
+        wr.writeheader()
+        if pair_rows:
+            wr.writerows(pair_rows)
 
     splits_dir = args.out_root / "splits"
     splits_dir.mkdir(parents=True, exist_ok=True)

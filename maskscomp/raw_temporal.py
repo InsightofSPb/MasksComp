@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import csv
+import fnmatch
+import json
 import math
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
@@ -19,9 +22,13 @@ from maskscomp.models.msdzip import MixedModel
 class TemporalPairRecord:
     pair_id: str
     sample_id: str
+    facade_id: str
     prev_path: str
     cur_path: str
-    split: str
+    year_a: str = ""
+    year_b: str = ""
+    split: str = "train"
+    delta_years: str = ""
     homography_path: str = ""
     valid_mask_path: str = ""
     lposs_prev_path: str = ""
@@ -29,29 +36,74 @@ class TemporalPairRecord:
     superpixel_labels_path: str = ""
 
 
+def _guess_split(csv_name: str) -> str:
+    n = csv_name.lower()
+    if "val" in n:
+        return "val"
+    if "test" in n:
+        return "test"
+    return "train"
+
+
+def _basename_no_ext(path_like: str) -> str:
+    return Path(str(path_like)).stem
+
+
 def read_pairs_csv(path: Path) -> List[TemporalPairRecord]:
     rows: List[TemporalPairRecord] = []
     with path.open("r", newline="", encoding="utf-8") as f:
         rd = csv.DictReader(f)
-        required = {"pair_id", "sample_id", "prev_path", "cur_path", "split"}
-        missing = required.difference(rd.fieldnames or [])
-        if missing:
-            raise ValueError(f"Missing required columns in {path}: {sorted(missing)}")
-        for r in rd:
-            rows.append(
-                TemporalPairRecord(
-                    pair_id=str(r["pair_id"]),
-                    sample_id=str(r["sample_id"]),
-                    prev_path=str(r["prev_path"]),
-                    cur_path=str(r["cur_path"]),
-                    split=str(r["split"]),
-                    homography_path=str(r.get("homography_path", "") or ""),
-                    valid_mask_path=str(r.get("valid_mask_path", "") or ""),
-                    lposs_prev_path=str(r.get("lposs_prev_path", "") or ""),
-                    lposs_cur_path=str(r.get("lposs_cur_path", "") or ""),
-                    superpixel_labels_path=str(r.get("superpixel_labels_path", "") or ""),
-                )
+        cols = set(rd.fieldnames or [])
+
+        has_new = {"pair_id", "sample_id", "prev_path", "cur_path"}.issubset(cols)
+        has_existing = {"pair_id", "facade_id", "year_a", "year_b", "mask_a", "mask_b"}.issubset(cols)
+
+        if not (has_new or has_existing):
+            raise ValueError(
+                f"Unsupported pair CSV format in {path}. Expected either "
+                "(pair_id,sample_id,prev_path,cur_path[,split...]) or "
+                "(pair_id,facade_id,year_a,year_b,mask_a,mask_b[,delta_years])."
             )
+
+        default_split = _guess_split(path.name)
+        for r in rd:
+            if has_existing:
+                facade_id = str(r["facade_id"])
+                year_a = str(r.get("year_a", "") or "")
+                year_b = str(r.get("year_b", "") or "")
+                rows.append(
+                    TemporalPairRecord(
+                        pair_id=str(r["pair_id"]),
+                        sample_id=facade_id,
+                        facade_id=facade_id,
+                        prev_path=str(r["mask_a"]),
+                        cur_path=str(r["mask_b"]),
+                        year_a=year_a,
+                        year_b=year_b,
+                        split=str(r.get("split", default_split) or default_split),
+                        delta_years=str(r.get("delta_years", "") or ""),
+                    )
+                )
+            else:
+                sample_id = str(r["sample_id"])
+                rows.append(
+                    TemporalPairRecord(
+                        pair_id=str(r["pair_id"]),
+                        sample_id=sample_id,
+                        facade_id=str(r.get("facade_id", sample_id) or sample_id),
+                        prev_path=str(r["prev_path"]),
+                        cur_path=str(r["cur_path"]),
+                        year_a=str(r.get("year_a", "") or ""),
+                        year_b=str(r.get("year_b", "") or ""),
+                        split=str(r.get("split", default_split) or default_split),
+                        delta_years=str(r.get("delta_years", "") or ""),
+                        homography_path=str(r.get("homography_path", "") or ""),
+                        valid_mask_path=str(r.get("valid_mask_path", "") or ""),
+                        lposs_prev_path=str(r.get("lposs_prev_path", "") or ""),
+                        lposs_cur_path=str(r.get("lposs_cur_path", "") or ""),
+                        superpixel_labels_path=str(r.get("superpixel_labels_path", "") or ""),
+                    )
+                )
     return rows
 
 
@@ -97,6 +149,139 @@ def align_prev_to_cur(prev_rgb: np.ndarray, cur_shape: Tuple[int, int], homograp
         borderMode=cv2.BORDER_REFLECT,
     )
     return warped
+
+
+def _path_candidates(root: Path, patterns: Sequence[str]) -> List[Path]:
+    out: List[Path] = []
+    for p in root.rglob("*"):
+        if not p.is_file():
+            continue
+        rel = str(p.relative_to(root)).lower()
+        for pat in patterns:
+            if fnmatch.fnmatch(rel, pat.lower()):
+                out.append(p)
+                break
+    return out
+
+
+def _score_asset(path: Path, year_a: str, year_b: str, hint_prev: str, hint_cur: str, target: str) -> int:
+    n = str(path).lower()
+    s = 0
+    if year_a and year_a in n:
+        s += 2
+    if year_b and year_b in n:
+        s += 2
+    if target == "prev_aligned":
+        for k in ["align", "aligned", "warp", "warped", "to_", "to"]:
+            if k in n:
+                s += 3
+        if hint_prev and hint_prev in n:
+            s += 3
+        if hint_cur and hint_cur in n:
+            s += 2
+    elif target == "cur":
+        for k in ["cur", "current", "ref", "target", "year_b", "b"]:
+            if k in n:
+                s += 2
+        if hint_cur and hint_cur in n:
+            s += 4
+    return s
+
+
+def resolve_prealigned_assets(prealigned_root: Path, rec: TemporalPairRecord) -> Dict[str, str]:
+    facade_dir = prealigned_root / rec.facade_id
+    if not facade_dir.exists():
+        raise FileNotFoundError(
+            f"Prealigned facade directory not found for pair_id={rec.pair_id} facade_id={rec.facade_id}: {facade_dir}"
+        )
+
+    img_ext = ["*.png", "*.jpg", "*.jpeg", "*.tif", "*.tiff", "*.bmp", "*.webp"]
+    files = [p for p in facade_dir.rglob("*") if p.is_file()]
+    imgs = [p for p in files if any(fnmatch.fnmatch(p.name.lower(), e) for e in img_ext)]
+
+    ya = str(rec.year_a)
+    yb = str(rec.year_b)
+    hint_prev = _basename_no_ext(rec.prev_path).lower()
+    hint_cur = _basename_no_ext(rec.cur_path).lower()
+
+    prev_pool = [
+        p for p in imgs if (ya in str(p) if ya else True) and (yb in str(p) if yb else True) and any(k in str(p).lower() for k in ["align", "warp", "to", "aligned"])
+    ]
+    cur_pool = [p for p in imgs if (yb in str(p) if yb else True)]
+    if not prev_pool:
+        prev_pool = imgs
+    if not cur_pool:
+        cur_pool = imgs
+
+    prev_ranked = sorted(prev_pool, key=lambda p: _score_asset(p, ya, yb, hint_prev, hint_cur, "prev_aligned"), reverse=True)
+    cur_ranked = sorted(cur_pool, key=lambda p: _score_asset(p, ya, yb, hint_prev, hint_cur, "cur"), reverse=True)
+
+    if not prev_ranked or not cur_ranked:
+        searched = [str(p.relative_to(facade_dir)) for p in files[:200]]
+        raise RuntimeError(
+            "Could not resolve prealigned pair assets. "
+            f"pair_id={rec.pair_id} facade_id={rec.facade_id} year_a={rec.year_a} year_b={rec.year_b} "
+            f"searched_under={facade_dir} files_sample={searched}"
+        )
+
+    prev_aligned = prev_ranked[0]
+    cur_img = cur_ranked[0]
+
+    valid_mask = None
+    for p in imgs:
+        n = str(p).lower()
+        if any(k in n for k in ["valid", "roi", "facade_mask", "fg_mask", "mask_valid"]):
+            valid_mask = p
+            break
+
+    superpixel = None
+    for p in files:
+        n = str(p).lower()
+        if any(k in n for k in ["superpixel", "spx", ".labels.npz", "labels.npz"]):
+            superpixel = p
+            break
+
+    overlay = None
+    for p in imgs:
+        n = str(p).lower()
+        if any(k in n for k in ["overlay", "viz", "visual", "blend"]):
+            overlay = p
+            break
+
+    return {
+        "facade_dir": str(facade_dir),
+        "prev_aligned_rgb": str(prev_aligned),
+        "cur_rgb": str(cur_img),
+        "valid_mask": str(valid_mask) if valid_mask else "",
+        "superpixel_labels": str(superpixel) if superpixel else "",
+        "overlay_viz": str(overlay) if overlay else "",
+    }
+
+
+def read_geom_metadata(geom_root: Optional[Path], rec: TemporalPairRecord) -> Dict[str, object]:
+    fields = {
+        "num_matches": "",
+        "num_inliers": "",
+        "inlier_ratio": "",
+        "iou_fg": "",
+        "iou_edge": "",
+        "status_quality": "",
+        "geom_path": "",
+    }
+    if geom_root is None:
+        return fields
+    gp = geom_root / rec.facade_id / f"{rec.year_a}_{rec.year_b}.json"
+    if not gp.exists():
+        return fields
+    data = json.loads(gp.read_text(encoding="utf-8"))
+    fields["num_matches"] = data.get("num_matches", "")
+    fields["num_inliers"] = data.get("num_inliers", "")
+    fields["inlier_ratio"] = data.get("inlier_ratio", "")
+    fields["iou_fg"] = data.get("iou_fg", "")
+    fields["iou_edge"] = data.get("iou_edge", "")
+    fields["status_quality"] = data.get("status_quality", "")
+    fields["geom_path"] = str(gp)
+    return fields
 
 
 def modular_residual(cur_rgb: np.ndarray, aligned_prev_rgb: np.ndarray) -> np.ndarray:
