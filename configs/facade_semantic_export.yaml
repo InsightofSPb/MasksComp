@@ -1,0 +1,11 @@
+backend:
+  # options: fallback | lposs_helper | python_callable
+  kind: fallback
+  name: fallback_color_facade_v1
+
+# Required only for lposs_helper backend
+# lposs_config: /path/to/lposs/config.yaml
+# dataset_config: /path/to/dataset_config.yaml
+# backend:
+#   kind: lposs_helper
+#   helper_path: /path/to/lposs_inference.py

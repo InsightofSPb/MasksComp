@@ -233,3 +233,45 @@ python tools/tiles_eval_to_heatmaps.py \
   --tiles-eval-csv "$OUT_A_NN/val_tiles_per_image.csv" \
   --out-dir "$OUT_A_NN"
 ```
+
+## Facade semantic export (S2 stage input)
+
+Export semantic artifacts from facade imagery into a stable index:
+
+```bash
+PYTHONPATH=$(pwd) python tools/export_facade_semantics.py \
+  --input-root /path/to/facade_images \
+  --config configs/facade_semantic_export.yaml \
+  --checkpoint /path/to/checkpoint.pth \
+  --output-root output/facade_semantics \
+  --device cpu \
+  --save-mask --save-probs --save-features --save-overlay
+```
+
+Artifacts are written under `output-root`:
+- `masks/<sample_id>.png` class-id map
+- `probs/<sample_id>.npz` dense probs/logits when available
+- `features/<sample_id>.npz` backbone/tile feature tensor (always exported)
+- `overlays/<sample_id>.jpg` visualization
+- `index.csv` artifact manifest
+
+Default backend is a lightweight self-contained fallback (`backend.kind: fallback`).
+For LPOSS helper compatibility, provide `backend.kind: lposs_helper` and `backend.helper_path` in config.
+
+## Temporal semantic features for aligned facade pairs
+
+Build per-tile semantic temporal features from aligned pairs + semantic artifacts:
+
+```bash
+PYTHONPATH=$(pwd) python tools/build_temporal_semantic_features.py \
+  --pairs-csv /path/to/pairs.csv \
+  --semantic-index output/facade_semantics/index.csv \
+  --output-root output/temporal_semantic \
+  --tile-size 64 --stride 32 \
+  --alpha 1.0 --beta 1.0 --gamma 1.0
+```
+
+Outputs:
+- `temporal_semantic_features.csv` (per tile features + semantic score)
+- `heatmaps_semantic/<pair_id>.npz`
+- `previews_semantic/<pair_id>.jpg`
