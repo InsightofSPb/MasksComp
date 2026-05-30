@@ -8,8 +8,10 @@ recomputed and no heuristic asset lookup is used. The saved residual is
 for context and excluded from loss/scoring through a parallel byte-valid mask.
 
 The current quantitative protocol uses non-overlapping tiles, i.e.
-``stride == tile_size``. This keeps tile coordinates directly compatible with
-the GT-reference evaluator.
+``stride == tile_size``. Edge tiles are zero-padded to a fixed byte-sequence
+length, while padding bytes are excluded by the validity mask. Their validity
+fraction is computed over actual image content only, matching the baseline
+score grid in Compress_to_prevent.
 """
 from __future__ import annotations
 
@@ -72,6 +74,18 @@ def modular_residual(current: np.ndarray, previous_aligned: np.ndarray) -> np.nd
     return ((current.astype(np.int16) - previous_aligned.astype(np.int16)) % 256).astype(np.uint8)
 
 
+def padded_tile(arr: np.ndarray, y: int, x: int, tile_size: int, fill_value=0) -> tuple[np.ndarray, int, int]:
+    content_h = min(tile_size, arr.shape[0] - y)
+    content_w = min(tile_size, arr.shape[1] - x)
+    if arr.ndim == 3:
+        output = np.full((tile_size, tile_size, arr.shape[2]), fill_value, dtype=arr.dtype)
+        output[:content_h, :content_w, :] = arr[y:y + content_h, x:x + content_w, :]
+    else:
+        output = np.full((tile_size, tile_size), fill_value, dtype=arr.dtype)
+        output[:content_h, :content_w] = arr[y:y + content_h, x:x + content_w]
+    return output, content_h, content_w
+
+
 def main() -> None:
     args = parse_args()
     if args.tile_size <= 0 or args.stride <= 0:
@@ -121,18 +135,22 @@ def main() -> None:
         valid_sequences: List[np.ndarray] = []
         tile_yx: List[tuple[int, int]] = []
         valid_fractions: List[float] = []
-        for y in range(0, height - args.tile_size + 1, args.stride):
-            for x in range(0, width - args.tile_size + 1, args.stride):
-                valid_tile = valid[y:y + args.tile_size, x:x + args.tile_size]
-                fraction = float(valid_tile.mean())
+        content_shapes: List[tuple[int, int]] = []
+        for y in range(0, height, args.stride):
+            for x in range(0, width, args.stride):
+                tile, content_h, content_w = padded_tile(residual, y, x, args.tile_size, fill_value=0)
+                valid_tile, _, _ = padded_tile(valid.astype(np.uint8), y, x, args.tile_size, fill_value=0)
+                valid_content = valid_tile[:content_h, :content_w] > 0
+                content_pixels = content_h * content_w
+                fraction = float(valid_content.sum() / max(content_pixels, 1))
                 if fraction < threshold:
                     continue
-                tile = residual[y:y + args.tile_size, x:x + args.tile_size]
-                byte_valid = np.repeat(valid_tile[..., None], 3, axis=2).reshape(-1).astype(np.uint8)
+                byte_valid = np.repeat((valid_tile > 0)[..., None], 3, axis=2).reshape(-1).astype(np.uint8)
                 sequences.append(tile.reshape(-1).astype(np.uint8))
                 valid_sequences.append(byte_valid)
                 tile_yx.append((y, x))
                 valid_fractions.append(fraction)
+                content_shapes.append((content_h, content_w))
                 tile_rows.append({
                     "pair_id": pair_id,
                     "facade_id": row["facade_id"],
@@ -142,7 +160,10 @@ def main() -> None:
                     "tile_y": y // args.tile_size,
                     "tile_x": x // args.tile_size,
                     "tile_size": args.tile_size,
+                    "content_height": content_h,
+                    "content_width": content_w,
                     "valid_fraction": fraction,
+                    "valid_pixel_count": int(valid_content.sum()),
                     "valid_byte_count": int(byte_valid.sum()),
                 })
 
@@ -153,6 +174,7 @@ def main() -> None:
                 valid_sequences=np.stack(valid_sequences),
                 tile_yx=np.asarray(tile_yx, dtype=np.int32),
                 valid_fraction=np.asarray(valid_fractions, dtype=np.float32),
+                content_shape=np.asarray(content_shapes, dtype=np.int32),
                 tile_size=np.int32(args.tile_size),
                 stride=np.int32(args.stride),
                 H=np.int32(height),
@@ -191,6 +213,7 @@ def main() -> None:
         "pairs_by_split": by_split,
         "tiles_by_split": tiles_by_split,
         "n_tiles": len(tile_rows),
+        "edge_tile_policy": "right/bottom partial content is zero-padded; padding excluded from target bytes",
         "residual_definition": "current RGB minus warped previous RGB modulo 256",
         "validity_policy": "invalid residual bytes are zero context values and are excluded as loss/score targets",
     }
