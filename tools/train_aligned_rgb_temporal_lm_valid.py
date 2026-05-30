@@ -4,6 +4,11 @@
 Invalid residual bytes are retained only as zero-valued context placeholders and
 are never selected as prediction targets. This preserves tile geometry while
 excluding warp-invalid regions from the learned codelength objective.
+
+The valid target index is sampled before materialization. This is important for
+RGB residual datasets, where tens of thousands of tiles can yield hundreds of
+millions of valid byte targets even when only a controlled training subset is
+required for a first experiment.
 """
 from __future__ import annotations
 
@@ -40,24 +45,64 @@ class ValidWindowDataset(Dataset):
             raise ValueError("sequences and valid_sequences lengths differ")
         self.sequences = sequences
         self.timesteps = int(timesteps)
-        index: List[Tuple[int, int]] = []
-        for seq_index, (sequence, valid) in enumerate(zip(sequences, valid_sequences)):
+
+        counts = np.zeros((len(sequences),), dtype=np.int64)
+        for sequence_index, (sequence, valid) in enumerate(zip(sequences, valid_sequences)):
             if sequence.shape != valid.shape:
                 raise ValueError("sequence/valid mask shape mismatch")
             # Position zero has no preceding symbol under the inherited LM protocol.
-            valid_target_positions = np.flatnonzero(valid[1:] > 0) + 1
-            index.extend((seq_index, int(position)) for position in valid_target_positions.tolist())
-        if max_samples is not None and len(index) > int(max_samples):
-            rng = random.Random(seed)
-            index = rng.sample(index, int(max_samples))
-        self.index = index
+            counts[sequence_index] = int(np.count_nonzero(valid[1:] > 0))
+        cumulative = np.cumsum(counts)
+        self.n_available_targets = int(cumulative[-1]) if cumulative.size else 0
+        if self.n_available_targets == 0:
+            self.sequence_indices = np.empty((0,), dtype=np.int32)
+            self.positions = np.empty((0,), dtype=np.int32)
+            return
+
+        n_selected = self.n_available_targets
+        if max_samples is not None:
+            n_selected = min(int(max_samples), self.n_available_targets)
+        elif self.n_available_targets > 10_000_000:
+            raise ValueError(
+                "The dataset contains {} valid byte targets. Pass --max-train-samples/--max-val-samples "
+                "to avoid materializing an excessively large full index.".format(self.n_available_targets)
+            )
+
+        if n_selected < self.n_available_targets:
+            # random.sample(range(...)) selects only requested flat ids without creating
+            # a list for the full available-target population.
+            selected_flat = np.asarray(
+                sorted(random.Random(seed).sample(range(self.n_available_targets), n_selected)),
+                dtype=np.int64,
+            )
+        else:
+            selected_flat = np.arange(self.n_available_targets, dtype=np.int64)
+
+        sequence_indices = np.searchsorted(cumulative, selected_flat, side="right").astype(np.int32)
+        previous_cumulative = np.concatenate((np.asarray([0], dtype=np.int64), cumulative[:-1]))
+        local_ranks = selected_flat - previous_cumulative[sequence_indices]
+        positions = np.empty((n_selected,), dtype=np.int32)
+
+        unique_sequences, starts, selected_counts = np.unique(
+            sequence_indices, return_index=True, return_counts=True
+        )
+        for sequence_index, start, selected_count in zip(
+            unique_sequences.tolist(), starts.tolist(), selected_counts.tolist()
+        ):
+            end = start + selected_count
+            available_positions = np.flatnonzero(valid_sequences[sequence_index][1:] > 0).astype(np.int32) + 1
+            positions[start:end] = available_positions[local_ranks[start:end]]
+
+        self.sequence_indices = sequence_indices
+        self.positions = positions
 
     def __len__(self) -> int:
-        return len(self.index)
+        return int(self.positions.size)
 
     def __getitem__(self, idx: int):
-        seq_index, position = self.index[idx]
-        sequence = self.sequences[seq_index]
+        sequence_index = int(self.sequence_indices[idx])
+        position = int(self.positions[idx])
+        sequence = self.sequences[sequence_index]
         start = max(0, position - self.timesteps)
         context = np.zeros((self.timesteps,), dtype=np.int64)
         window = sequence[start:position].astype(np.int64)
@@ -169,9 +214,12 @@ def main() -> None:
         "n_val_pairs": len(val_ids),
         "n_train_tiles": len(train_sequences),
         "n_val_tiles": len(val_sequences),
+        "n_train_available_valid_targets": train_dataset.n_available_targets,
+        "n_val_available_valid_targets": val_dataset.n_available_targets,
         "n_train_target_samples": len(train_dataset),
         "n_val_target_samples": len(val_dataset),
         "target_validity_policy": "invalid residual bytes excluded from loss; retained as zero context placeholders",
+        "index_sampling_policy": "valid target positions sampled before materializing bounded training/validation index",
     })
     (args.out_dir / "run_config.json").write_text(json.dumps(run_config, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
     print(json.dumps(run_config, indent=2, ensure_ascii=False, default=str))
