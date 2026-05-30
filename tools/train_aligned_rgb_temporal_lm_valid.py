@@ -24,6 +24,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
+from tqdm.auto import tqdm
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -40,6 +41,8 @@ class ValidWindowDataset(Dataset):
         timesteps: int,
         max_samples: Optional[int] = None,
         seed: int = 42,
+        progress_desc: Optional[str] = None,
+        disable_progress: bool = False,
     ) -> None:
         if len(sequences) != len(valid_sequences):
             raise ValueError("sequences and valid_sequences lengths differ")
@@ -47,7 +50,16 @@ class ValidWindowDataset(Dataset):
         self.timesteps = int(timesteps)
 
         counts = np.zeros((len(sequences),), dtype=np.int64)
-        for sequence_index, (sequence, valid) in enumerate(zip(sequences, valid_sequences)):
+        counting_iter = enumerate(zip(sequences, valid_sequences))
+        counting_iter = tqdm(
+            counting_iter,
+            total=len(sequences),
+            desc=progress_desc or "Indexing valid targets",
+            unit="tile",
+            leave=False,
+            disable=disable_progress,
+        )
+        for sequence_index, (sequence, valid) in counting_iter:
             if sequence.shape != valid.shape:
                 raise ValueError("sequence/valid mask shape mismatch")
             # Position zero has no preceding symbol under the inherited LM protocol.
@@ -86,9 +98,16 @@ class ValidWindowDataset(Dataset):
         unique_sequences, starts, selected_counts = np.unique(
             sequence_indices, return_index=True, return_counts=True
         )
-        for sequence_index, start, selected_count in zip(
-            unique_sequences.tolist(), starts.tolist(), selected_counts.tolist()
-        ):
+        positions_iter = zip(unique_sequences.tolist(), starts.tolist(), selected_counts.tolist())
+        positions_iter = tqdm(
+            positions_iter,
+            total=len(unique_sequences),
+            desc=(progress_desc or "Indexing valid targets") + " sampled positions",
+            unit="tile",
+            leave=False,
+            disable=disable_progress,
+        )
+        for sequence_index, start, selected_count in positions_iter:
             end = start + selected_count
             available_positions = np.flatnonzero(valid_sequences[sequence_index][1:] > 0).astype(np.int32) + 1
             positions[start:end] = available_positions[local_ranks[start:end]]
@@ -130,6 +149,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--no-progress", action="store_true", help="Disable tqdm progress bars.")
     return parser.parse_args()
 
 
@@ -139,10 +159,15 @@ def load_ids(path: Path) -> List[str]:
     return [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
-def load_sequences(dataset_root: Path, pair_ids: List[str]) -> Tuple[List[np.ndarray], List[np.ndarray]]:
+def load_sequences(
+    dataset_root: Path,
+    pair_ids: List[str],
+    desc: str,
+    disable_progress: bool = False,
+) -> Tuple[List[np.ndarray], List[np.ndarray]]:
     sequences: List[np.ndarray] = []
     valid_sequences: List[np.ndarray] = []
-    for pair_id in pair_ids:
+    for pair_id in tqdm(pair_ids, desc=desc, unit="pair", disable=disable_progress):
         path = dataset_root / "tiles" / (pair_id + ".npz")
         if not path.exists():
             continue
@@ -157,17 +182,26 @@ def load_sequences(dataset_root: Path, pair_ids: List[str]) -> Tuple[List[np.nda
 
 
 @torch.no_grad()
-def evaluate(model: ByteMSDZipLM, loader: DataLoader, device: torch.device) -> float:
+def evaluate(
+    model: ByteMSDZipLM,
+    loader: DataLoader,
+    device: torch.device,
+    epoch: int,
+    disable_progress: bool = False,
+) -> float:
     model.eval()
     total_loss = 0.0
     total_count = 0
-    for context, target in loader:
+    progress = tqdm(loader, desc="Epoch {} validation".format(epoch), unit="batch", disable=disable_progress)
+    for context, target in progress:
         context = context.to(device)
         target = target.to(device)
         logits = model(context)[:, -1, :]
         loss = F.cross_entropy(logits, target, reduction="sum")
         total_loss += float(loss.item())
         total_count += int(target.numel())
+        running_nll = total_loss / max(total_count, 1)
+        progress.set_postfix(val_bpb="{:.4f}".format(running_nll / np.log(2.0)))
     return total_loss / max(total_count, 1)
 
 
@@ -180,18 +214,27 @@ def main() -> None:
 
     train_ids = load_ids(args.splits_dir / "facade_train.txt")
     val_ids = load_ids(args.splits_dir / "facade_val.txt")
-    train_sequences, train_valid = load_sequences(args.dataset_root, train_ids)
-    val_sequences, val_valid = load_sequences(args.dataset_root, val_ids)
+    print("Loading train RGB residual tile sequences...", flush=True)
+    train_sequences, train_valid = load_sequences(
+        args.dataset_root, train_ids, "Loading train tile files", disable_progress=args.no_progress
+    )
+    print("Loading validation RGB residual tile sequences...", flush=True)
+    val_sequences, val_valid = load_sequences(
+        args.dataset_root, val_ids, "Loading val tile files", disable_progress=args.no_progress
+    )
     if not train_sequences or not val_sequences:
         raise ValueError("No train/val residual tile sequences loaded")
 
+    print("Building sampled valid-target indices...", flush=True)
     train_dataset = ValidWindowDataset(
         train_sequences, train_valid, args.timesteps,
         max_samples=args.max_train_samples, seed=args.seed,
+        progress_desc="Indexing train targets", disable_progress=args.no_progress,
     )
     val_dataset = ValidWindowDataset(
         val_sequences, val_valid, args.timesteps,
         max_samples=args.max_val_samples, seed=args.seed,
+        progress_desc="Indexing val targets", disable_progress=args.no_progress,
     )
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=0)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0)
@@ -222,7 +265,7 @@ def main() -> None:
         "index_sampling_policy": "valid target positions sampled before materializing bounded training/validation index",
     })
     (args.out_dir / "run_config.json").write_text(json.dumps(run_config, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
-    print(json.dumps(run_config, indent=2, ensure_ascii=False, default=str))
+    print(json.dumps(run_config, indent=2, ensure_ascii=False, default=str), flush=True)
 
     best_val_nll = float("inf")
     log_rows: List[dict] = []
@@ -230,7 +273,13 @@ def main() -> None:
         model.train()
         total_loss = 0.0
         total_count = 0
-        for context, target in train_loader:
+        progress = tqdm(
+            train_loader,
+            desc="Epoch {}/{} train".format(epoch, args.epochs),
+            unit="batch",
+            disable=args.no_progress,
+        )
+        for context, target in progress:
             context = context.to(device)
             target = target.to(device)
             optimizer.zero_grad(set_to_none=True)
@@ -240,8 +289,14 @@ def main() -> None:
             optimizer.step()
             total_loss += float(loss.item()) * int(target.numel())
             total_count += int(target.numel())
+            running_nll = total_loss / max(total_count, 1)
+            progress.set_postfix(
+                loss="{:.4f}".format(float(loss.item())),
+                avg_bpb="{:.4f}".format(running_nll / np.log(2.0)),
+                lr="{:.2e}".format(optimizer.param_groups[0]["lr"]),
+            )
         train_nll = total_loss / max(total_count, 1)
-        val_nll = evaluate(model, val_loader, device)
+        val_nll = evaluate(model, val_loader, device, epoch=epoch, disable_progress=args.no_progress)
         record = {
             "epoch": epoch,
             "train_nll": train_nll,
@@ -257,10 +312,11 @@ def main() -> None:
             torch.save(checkpoint, args.out_dir / "best.pt")
         torch.save(checkpoint, args.out_dir / "last.pt")
 
-    with (args.out_dir / "train_log.csv").open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(log_rows[0].keys()))
-        writer.writeheader()
-        writer.writerows(log_rows)
+        with (args.out_dir / "train_log.csv").open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(log_rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(log_rows)
+
     print("Best validation bpb: {:.6f}".format(best_val_nll / np.log(2.0)))
     print("Checkpoint: {}".format(args.out_dir / "best.pt"))
 
